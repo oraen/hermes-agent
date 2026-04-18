@@ -1,23 +1,34 @@
 #!/usr/bin/env python3
 """
-AI Agent Runner with Tool Calling
+AI Agent 核心运行器 - 带工具调用功能
 
-This module provides a clean, standalone agent that can execute AI models
-with tool calling capabilities. It handles the conversation loop, tool execution,
-and response management.
+本模块提供了一个简洁、独立的智能体，能够执行支持工具调用的 AI 模型。
+它负责管理对话循环、工具执行和响应管理。
 
-Features:
-- Automatic tool calling loop until completion
-- Configurable model parameters
-- Error handling and recovery
-- Message history management
-- Support for multiple model providers
+功能特性:
+- 自动工具调用循环，直到任务完成
+- 可配置的模型参数（温度、最大 token 数等）
+- 完善的错误处理和恢复机制
+- 消息历史管理
+- 支持多个模型提供商（OpenAI、Anthropic、OpenRouter 等）
+- 上下文压缩和内存管理
+- 子智能体委派
+- 对话轨迹保存
 
-Usage:
+使用场景:
+- 作为独立智能体直接调用
+- 被 CLI 模块（cli.py）集成使用
+- 被网关模块（gateway/）集成用于消息平台
+- 批量处理和数据生成
+
+用法示例:
     from run_agent import AIAgent
     
     agent = AIAgent(base_url="http://localhost:30000/v1", model="claude-opus-4-20250514")
-    response = agent.run_conversation("Tell me about the latest Python updates")
+    response = agent.run_conversation("告诉我最新的 Python 更新")
+    
+    # 或使用简单的聊天接口
+    response = agent.chat("你好！")
 """
 
 import asyncio
@@ -111,22 +122,23 @@ from utils import atomic_json_write, env_var_enabled
 
 
 class _SafeWriter:
-    """Transparent stdio wrapper that catches OSError/ValueError from broken pipes.
+    """透明的标准输出包装器，捕获因管道断裂导致的 OSError/ValueError。
 
-    When hermes-agent runs as a systemd service, Docker container, or headless
-    daemon, the stdout/stderr pipe can become unavailable (idle timeout, buffer
-    exhaustion, socket reset). Any print() call then raises
-    ``OSError: [Errno 5] Input/output error``, which can crash agent setup or
-    run_conversation() — especially via double-fault when an except handler
-    also tries to print.
+    使用场景:
+    - 当 hermes-agent 作为 systemd 服务、Docker 容器或无头守护进程运行时，
+      stdout/stderr 管道可能变得不可用（空闲超时、缓冲区耗尽、套接字重置）。
+      任何 print() 调用都会引发 OSError: [Errno 5] Input/output error，
+      可能导致 agent 设置或 run_conversation() 崩溃。
 
-    Additionally, when subagents run in ThreadPoolExecutor threads, the shared
-    stdout handle can close between thread teardown and cleanup, raising
-    ``ValueError: I/O operation on closed file`` instead of OSError.
+    - 当子智能体在 ThreadPoolExecutor 线程中运行时，共享的 stdout 句柄
+      可能在线程拆卸和清理之间关闭，引发 ValueError: I/O operation on closed file。
 
-    This wrapper delegates all writes to the underlying stream and silently
-    catches both OSError and ValueError. It is transparent when the wrapped
-    stream is healthy.
+    工作原理:
+    - 将所有写入操作委托给底层流
+    - 静默捕获 OSError 和 ValueError
+    - 当包装的流健康时完全透明
+
+    主要用途: 防止尽力而为的控制台输出崩溃整个智能体
     """
 
     __slots__ = ("_inner",)
@@ -168,18 +180,24 @@ def _install_safe_stdio() -> None:
 
 
 class IterationBudget:
-    """Thread-safe iteration counter for an agent.
+    """线程安全的智能体迭代计数器。
 
-    Each agent (parent or subagent) gets its own ``IterationBudget``.
-    The parent's budget is capped at ``max_iterations`` (default 90).
-    Each subagent gets an independent budget capped at
-    ``delegation.max_iterations`` (default 50) — this means total
-    iterations across parent + subagents can exceed the parent's cap.
-    Users control the per-subagent limit via ``delegation.max_iterations``
-    in config.yaml.
+    功能概括:
+    - 每个智能体（父智能体或子智能体）都获得独立的 IterationBudget
+    - 父智能体的预算上限为 max_iterations（默认 90）
+    - 每个子智能体获得独立预算，上限为 delegation.max_iterations（默认 50）
+    - 这意味着父智能体 + 子智能体的总迭代次数可以超过父智能体的上限
+    - 用户通过 config.yaml 中的 delegation.max_iterations 控制每个子智能体的限制
 
-    ``execute_code`` (programmatic tool calling) iterations are refunded via
-    :meth:`refund` so they don't eat into the budget.
+    使用场景:
+    - 控制单轮对话中的最大工具调用次数
+    - 防止智能体陷入无限工具调用循环
+    - 子智能体委派时独立管理各自的迭代预算
+    - execute_code（编程式工具调用）迭代通过 refund() 方法退还，不消耗预算
+
+    线程安全:
+    - 使用 threading.Lock 保证并发安全
+    - 支持多线程环境下的预算消耗和退还
     """
 
     def __init__(self, max_total: int):
@@ -188,7 +206,13 @@ class IterationBudget:
         self._lock = threading.Lock()
 
     def consume(self) -> bool:
-        """Try to consume one iteration.  Returns True if allowed."""
+        """尝试消耗一次迭代。如果允许则返回 True。
+        
+        返回值:
+            bool: True 表示允许继续执行，False 表示已达迭代上限
+        
+        使用场景: 在每次 LLM API 调用前调用，检查是否还有迭代预算
+        """
         with self._lock:
             if self._used >= self.max_total:
                 return False
@@ -196,7 +220,10 @@ class IterationBudget:
             return True
 
     def refund(self) -> None:
-        """Give back one iteration (e.g. for execute_code turns)."""
+        """退还一次迭代（例如用于 execute_code 轮次）。
+        
+        使用场景: execute_code 工具调用不消耗迭代预算，调用此方法退还已消耗的预算
+        """
         with self._lock:
             if self._used > 0:
                 self._used -= 1
@@ -533,11 +560,51 @@ def _qwen_portal_headers() -> dict:
 
 
 class AIAgent:
-    """
-    AI Agent with tool calling capabilities.
+    """AI 智能体核心类，具备工具调用能力。
 
-    This class manages the conversation flow, tool execution, and response handling
-    for AI models that support function calling.
+    功能概括:
+    - 管理完整的对话流程：系统提示构建、消息历史、工具执行、响应处理
+    - 支持多提供商 API（OpenAI Chat Completions、Anthropic Messages、OpenRouter、Codex Responses、AWS Bedrock）
+    - 自动工具调用循环，支持最多 90 次迭代（可配置）
+    - 上下文压缩和内存管理，支持长对话
+    - 子智能体委派，支持任务分解和并行执行
+    - 对话轨迹保存，支持调试和数据生成
+    - 流式输出支持，实时显示模型响应
+    - 错误分类和自动故障转移
+    - 提示词缓存优化，降低 API 成本
+
+    主要使用场景:
+    1. CLI 交互：通过 cli.py 提供终端交互式 AI 助手
+    2. 消息平台网关：通过 gateway/ 集成 Telegram、Discord、Slack 等平台
+    3. 批量处理：通过 batch_runner.py 并行处理大量任务
+    4. 数据生成：生成训练数据、轨迹样本等
+    5. ACP 集成：与 VS Code、Zed、JetBrains 等编辑器集成
+
+    核心接口:
+    - run_conversation(): 完整的对话循环，返回包含最终响应和消息历史的字典
+    - chat(): 简化的聊天接口，仅返回最终响应字符串
+
+    架构设计:
+    - 完全同步执行，简化并发模型
+    - 线程安全的迭代预算和中断机制
+    - 可插拔的回调系统，支持进度通知、流式输出等
+    - 配置驱动：支持从配置文件、环境变量、CLI 参数多层级配置
+
+    示例用法:
+        # 基础用法
+        agent = AIAgent(model="anthropic/claude-sonnet-4.6")
+        result = agent.run_conversation("帮我写一个 Python 函数")
+        print(result["final_response"])
+
+        # 带工具集限制
+        agent = AIAgent(
+            model="anthropic/claude-sonnet-4.6",
+            enabled_toolsets=["web", "terminal"],
+            max_iterations=50
+        )
+
+        # 简单聊天接口
+        response = agent.chat("你好！")
     """
 
     @property
@@ -560,7 +627,7 @@ class AIAgent:
         command: str = None,
         args: list[str] | None = None,
         model: str = "",
-        max_iterations: int = 90,  # Default tool-calling iterations (shared with subagents)
+        max_iterations: int = 90,  # 默认工具调用迭代次数（与子智能体共享）
         tool_delay: float = 1.0,
         enabled_toolsets: List[str] = None,
         disabled_toolsets: List[str] = None,
@@ -608,47 +675,88 @@ class AIAgent:
         pass_session_id: bool = False,
         persist_session: bool = True,
     ):
-        """
-        Initialize the AI Agent.
+        """初始化 AI 智能体。
 
-        Args:
-            base_url (str): Base URL for the model API (optional)
-            api_key (str): API key for authentication (optional, uses env var if not provided)
-            provider (str): Provider identifier (optional; used for telemetry/routing hints)
-            api_mode (str): API mode override: "chat_completions" or "codex_responses"
-            model (str): Model name to use (default: "anthropic/claude-opus-4.6")
-            max_iterations (int): Maximum number of tool calling iterations (default: 90)
-            tool_delay (float): Delay between tool calls in seconds (default: 1.0)
-            enabled_toolsets (List[str]): Only enable tools from these toolsets (optional)
-            disabled_toolsets (List[str]): Disable tools from these toolsets (optional)
-            save_trajectories (bool): Whether to save conversation trajectories to JSONL files (default: False)
-            verbose_logging (bool): Enable verbose logging for debugging (default: False)
-            quiet_mode (bool): Suppress progress output for clean CLI experience (default: False)
-            ephemeral_system_prompt (str): System prompt used during agent execution but NOT saved to trajectories (optional)
-            log_prefix_chars (int): Number of characters to show in log previews for tool calls/responses (default: 100)
-            log_prefix (str): Prefix to add to all log messages for identification in parallel processing (default: "")
-            providers_allowed (List[str]): OpenRouter providers to allow (optional)
-            providers_ignored (List[str]): OpenRouter providers to ignore (optional)
-            providers_order (List[str]): OpenRouter providers to try in order (optional)
-            provider_sort (str): Sort providers by price/throughput/latency (optional)
-            session_id (str): Pre-generated session ID for logging (optional, auto-generated if not provided)
-            tool_progress_callback (callable): Callback function(tool_name, args_preview) for progress notifications
-            clarify_callback (callable): Callback function(question, choices) -> str for interactive user questions.
-                Provided by the platform layer (CLI or gateway). If None, the clarify tool returns an error.
-            max_tokens (int): Maximum tokens for model responses (optional, uses model default if not set)
-            reasoning_config (Dict): OpenRouter reasoning configuration override (e.g. {"effort": "none"} to disable thinking).
-                If None, defaults to {"enabled": True, "effort": "medium"} for OpenRouter. Set to disable/customize reasoning.
-            prefill_messages (List[Dict]): Messages to prepend to conversation history as prefilled context.
-                Useful for injecting a few-shot example or priming the model's response style.
-                Example: [{"role": "user", "content": "Hi!"}, {"role": "assistant", "content": "Hello!"}]
-                NOTE: Anthropic Sonnet 4.6+ and Opus 4.6+ reject a conversation that ends on an
-                assistant-role message (400 error).  For those models use structured outputs or
-                output_config.format instead of a trailing-assistant prefill.
-            platform (str): The interface platform the user is on (e.g. "cli", "telegram", "discord", "whatsapp").
-                Used to inject platform-specific formatting hints into the system prompt.
-            skip_context_files (bool): If True, skip auto-injection of SOUL.md, AGENTS.md, and .cursorrules
-                into the system prompt. Use this for batch processing and data generation to avoid
-                polluting trajectories with user-specific persona or project instructions.
+        参数介绍:
+            核心配置:
+                base_url (str): 模型 API 的基础 URL（可选，默认使用 OpenRouter）
+                api_key (str): API 认证密钥（可选，未提供时使用环境变量）
+                provider (str): 提供商标识符（可选，用于遥测/路由提示）
+                api_mode (str): API 模式覆盖："chat_completions" 或 "codex_responses"
+                model (str): 使用的模型名称（默认："anthropic/claude-opus-4.6"）
+                max_iterations (int): 最大工具调用迭代次数（默认：90）
+                tool_delay (float): 工具调用之间的延迟秒数（默认：1.0）
+
+            工具集配置:
+                enabled_toolsets (List[str]): 仅启用这些工具集中的工具（可选）
+                disabled_toolsets (List[str]): 禁用这些工具集中的工具（可选）
+
+            会话管理:
+                session_id (str): 预生成的会话 ID（可选，未提供时自动生成）
+                session_db: SQLite 会话存储实例
+                parent_session_id (str): 父会话 ID（用于子智能体）
+                iteration_budget (IterationBudget): 迭代预算（可选，父智能体传入）
+                persist_session (bool): 是否持久化会话到数据库（默认：True）
+
+            回调函数:
+                tool_progress_callback (callable): 进度通知回调(tool_name, args_preview)
+                tool_start_callback (callable): 工具开始回调
+                tool_complete_callback (callable): 工具完成回调
+                thinking_callback (callable): 思考过程回调
+                reasoning_callback (callable): 推理内容回调
+                clarify_callback (callable): 交互式用户问题回调(question, choices) -> str
+                step_callback (callable): 步骤回调
+                stream_delta_callback (callable): 流式增量回调
+                interim_assistant_callback (callable): 临时助手消息回调
+                tool_gen_callback (callable): 工具生成回调
+                status_callback (callable): 状态回调
+
+            显示和日志:
+                save_trajectories (bool): 是否将对话轨迹保存到 JSONL 文件（默认：False）
+                verbose_logging (bool): 启用详细日志以进行调试（默认：False）
+                quiet_mode (bool): 抑制进度输出以获得清洁的 CLI 体验（默认：False）
+                ephemeral_system_prompt (str): 代理执行期间使用但不保存到轨迹的系统提示（可选）
+                log_prefix_chars (int): 日志预览中显示的字符数（默认：100）
+                log_prefix (str): 添加到所有日志消息的前缀，用于并行处理中的识别（默认：""）
+
+            提供商路由（OpenRouter）:
+                providers_allowed (List[str]): 允许的 OpenRouter 提供商（可选）
+                providers_ignored (List[str]): 忽略的 OpenRouter 提供商（可选）
+                providers_order (List[str]): 按顺序尝试的 OpenRouter 提供商（可选）
+                provider_sort (str): 按价格/吞吐量/延迟排序提供商（可选）
+                provider_require_parameters (bool): 是否需要参数（默认：False）
+                provider_data_collection (str): 数据收集偏好
+
+            模型配置:
+                max_tokens (int): 模型响应的最大 token 数（可选，未设置时使用模型默认值）
+                reasoning_config (Dict): OpenRouter 推理配置覆盖（例如 {"effort": "none"} 禁用思考）
+                service_tier (str): 服务层级偏好
+                request_overrides (Dict): 请求覆盖配置
+                prefill_messages (List[Dict]): 预填充消息，用于注入到对话历史作为上下文
+                fallback_model (Dict[str, Any]): 故障转移模型配置
+
+            平台和集成:
+                platform (str): 用户所在的界面平台（例如 "cli", "telegram", "discord", "whatsapp"）
+                user_id (str): 平台用户标识符（网关会话）
+                gateway_session_key (str): 每个聊天的稳定键
+                acp_command (str): ACP 命令
+                acp_args (list[str]): ACP 参数
+                pass_session_id (bool): 是否将会话 ID 传递给系统提示
+
+            上下文和内存:
+                skip_context_files (bool): 如果为 True，跳过自动注入 SOUL.md、AGENTS.md 和 .cursorrules
+                skip_memory (bool): 跳过内存加载
+
+            检查点:
+                checkpoints_enabled (bool): 是否启用文件系统检查点（默认：False）
+                checkpoint_max_snapshots (int): 最大检查点快照数（默认：50）
+
+        使用场景:
+            1. 基础 CLI 使用: AIAgent(model="anthropic/claude-sonnet-4.6")
+            2. 批量处理: AIAgent(quiet_mode=True, save_trajectories=True)
+            3. 网关集成: AIAgent(platform="telegram", session_id="...", session_db=...)
+            4. 子智能体: AIAgent(iteration_budget=parent.budget, parent_session_id="...")
+            5. 数据生成: AIAgent(skip_context_files=True, save_trajectories=True)
         """
         _install_safe_stdio()
 
@@ -8290,24 +8398,55 @@ class AIAgent:
         stream_callback: Optional[callable] = None,
         persist_user_message: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """
-        Run a complete conversation with tool calling until completion.
+        """运行完整的对话流程，包含工具调用，直到任务完成。
 
-        Args:
-            user_message (str): The user's message/question
-            system_message (str): Custom system message (optional, overrides ephemeral_system_prompt if provided)
-            conversation_history (List[Dict]): Previous conversation messages (optional)
-            task_id (str): Unique identifier for this task to isolate VMs between concurrent tasks (optional, auto-generated if not provided)
-            stream_callback: Optional callback invoked with each text delta during streaming.
-                Used by the TTS pipeline to start audio generation before the full response.
-                When None (default), API calls use the standard non-streaming path.
-            persist_user_message: Optional clean user message to store in
-                transcripts/history when user_message contains API-only
-                synthetic prefixes.
-                    or queuing follow-up prefetch work.
+        功能概括:
+        - 这是 AIAgent 的核心方法，实现了完整的对话循环
+        - 自动执行工具调用循环，直到模型给出最终响应或达到迭代上限
+        - 处理系统提示构建、上下文压缩、内存管理、错误恢复等
+        - 支持流式输出和多种回调机制
 
-        Returns:
-            Dict: Complete conversation result with final response and message history
+        参数介绍:
+            user_message (str): 用户的消息/问题
+            system_message (str): 自定义系统消息（可选，覆盖 ephemeral_system_prompt）
+            conversation_history (List[Dict]): 之前的对话消息（可选）
+            task_id (str): 任务的唯一标识符，用于隔离并发任务之间的 VM（可选，未提供时自动生成）
+            stream_callback (callable): 可选回调，在流式传输期间为每个文本增量调用。
+                用于 TTS 管线，在完整响应到达之前开始音频生成。
+                当为 None（默认）时，API 调用使用标准的非流式路径。
+            persist_user_message: 可选的清洁用户消息，用于存储到转录/历史中，
+                当 user_message 包含仅限 API 的合成前缀时使用。
+
+        返回值:
+            Dict: 完整的对话结果，包含：
+                - final_response (str): 最终的助手响应文本
+                - messages (List[Dict]): 完整的消息历史
+                - tool_calls (int): 工具调用次数
+                - iteration_count (int): 迭代次数
+                - cost_estimate (float): 预估成本（美元）
+                - error (str, optional): 错误信息（如果发生错误）
+
+        使用场景:
+            1. CLI 交互：处理用户的每个对话轮次
+            2. 网关消息：处理来自 Telegram/Discord 等平台的每条消息
+            3. 批量处理：在 batch_runner.py 中并行处理大量任务
+            4. 数据生成：生成训练数据和轨迹样本
+            5. 子智能体委派：父智能体调用子智能体的 run_conversation
+
+        工作流程:
+            1. 初始化：清理输入、加载会话历史、构建系统提示
+            2. 上下文压缩：如果对话超过模型上下文限制，自动压缩
+            3. 主循环：
+               a. 调用 LLM API 获取响应
+               b. 如果有工具调用，执行所有工具
+               c. 将工具结果添加到消息历史
+               d. 重复直到模型给出最终响应或达到迭代上限
+            4. 清理：保存轨迹、更新会话、返回结果
+
+        示例:
+            result = agent.run_conversation("帮我分析这个项目的代码质量")
+            print(result["final_response"])
+            print(f"工具调用次数: {result['tool_calls']}")
         """
         # Guard stdio against OSError from broken pipes (systemd/headless/daemon).
         # Installed once, transparent when streams are healthy, prevents crash on write.
@@ -11418,15 +11557,34 @@ class AIAgent:
         return result
 
     def chat(self, message: str, stream_callback: Optional[callable] = None) -> str:
-        """
-        Simple chat interface that returns just the final response.
+        """简单的聊天接口，仅返回最终响应。
 
-        Args:
-            message (str): User message
-            stream_callback: Optional callback invoked with each text delta during streaming.
+        功能概括:
+        - 这是 run_conversation() 的简化包装器
+        - 适用于只需要最终响应文本的场景
+        - 自动管理对话历史和工具调用循环
 
-        Returns:
-            str: Final assistant response
+        参数介绍:
+            message (str): 用户消息
+            stream_callback (callable): 可选回调，在流式传输期间为每个文本增量调用
+
+        返回值:
+            str: 最终的助手响应文本
+
+        使用场景:
+            1. 快速问答：不需要访问完整对话历史
+            2. API 集成：简化外部系统集成
+            3. 测试和调试：快速获取模型响应
+            4. 简单的单轮对话
+
+        示例:
+            # 最简单用法
+            response = agent.chat("你好！")
+            print(response)
+
+            # 与 run_conversation 对比
+            # result = agent.run_conversation("你好！")  # 返回完整字典
+            # response = result["final_response"]        # 需要提取
         """
         result = self.run_conversation(message, stream_callback=stream_callback)
         return result["final_response"]

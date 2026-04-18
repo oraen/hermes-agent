@@ -1,22 +1,29 @@
 #!/usr/bin/env python3
-"""
-Toolset Distributions Module
+"""Hermes Agent 工具集概率分布模块。
 
-This module defines distributions of toolsets for data generation runs.
-Each distribution specifies which toolsets should be used and their probability
-of being selected for any given prompt during the batch processing.
+本模块为批量数据生成（batch processing）定义工具集的选择概率分布。
+每个分布指定了在批量处理过程中，每个提示（prompt）应该使用哪些工具集
+以及它们被选中的概率。
 
-A distribution is a dictionary mapping toolset names to their selection probability (%).
-Probabilities should sum to 100, but the system will normalize if they don't.
+核心概念：
+    - 分布（Distribution）是一组工具集及其选择概率的映射
+    - 概率表示百分比（0-100），总和不一定要等于 100
+    - 每个工具集独立根据概率决定是否启用
+    - 系统会在概率总和非 100 时自动归一化
 
-Usage:
+使用示例：
     from toolset_distributions import get_distribution, list_distributions
     
-    # Get a specific distribution
+    # 获取特定分布
     dist = get_distribution("image_gen")
     
-    # List all available distributions
+    # 列出所有可用分布
     all_dists = list_distributions()
+
+主要用途：
+    - batch_runner.py 中的批量数据生成
+    - 为不同任务类型（研究、开发、图像生成）提供不同的工具配置
+    - 创建多样化的训练数据集
 """
 
 from typing import Dict, List, Optional
@@ -221,44 +228,74 @@ DISTRIBUTIONS = {
 
 
 def get_distribution(name: str) -> Optional[Dict[str, any]]:
-    """
-    Get a toolset distribution by name.
+    """按名称获取工具集分布定义。
     
-    Args:
-        name (str): Name of the distribution
-        
-    Returns:
-        Dict: Distribution definition with description and toolsets
-        None: If distribution not found
+    功能概括：
+        从 DISTRIBUTIONS 字典中获取指定分布的完整定义。
+    
+    参数：
+        name: 分布名称（如 "default"、"research"、"image_gen"）
+    
+    返回值：
+        dict | None: 分布定义字典，包含：
+            - description: 分布描述
+            - toolsets: {工具集名称: 概率百分比} 的映射
+            如果分布不存在则返回 None
+    
+    主要用于：
+        - batch_runner.py 中加载分布配置
+        - 查询特定分布的工具集概率
     """
     return DISTRIBUTIONS.get(name)
 
 
 def list_distributions() -> Dict[str, Dict]:
-    """
-    List all available distributions.
+    """列出所有可用的分布定义。
     
-    Returns:
-        Dict: All distribution definitions
+    功能概括：
+        返回所有已定义的工具集分布的副本。
+    
+    参数：
+        无
+    
+    返回值：
+        Dict[str, Dict]: 所有分布定义的副本
+                        {分布名称: 分布定义}
+    
+    主要用于：
+        - 显示可用分布列表
+        - 分布选择 UI 的数据源
+        - 遍历所有分布进行操作
     """
     return DISTRIBUTIONS.copy()
 
 
 def sample_toolsets_from_distribution(distribution_name: str) -> List[str]:
-    """
-    Sample toolsets based on a distribution's probabilities.
+    """根据分布的概率采样工具集。
     
-    Each toolset in the distribution has a % chance of being included.
-    This allows multiple toolsets to be active simultaneously.
+    功能概括：
+        根据分布定义中每个工具集的概率，独立采样决定哪些工具集被启用。
+        允许多个工具集同时激活，模拟真实使用场景中的工具集变化。
     
-    Args:
-        distribution_name (str): Name of the distribution to sample from
-        
-    Returns:
-        List[str]: List of sampled toolset names
-        
-    Raises:
-        ValueError: If distribution name is not found
+    参数：
+        distribution_name: 要采样的分布名称
+    
+    返回值：
+        List[str]: 采样得到的工具集名称列表
+    
+    异常：
+        ValueError: 如果分布名称不存在
+    
+    主要用于：
+        - batch_runner.py 中为每个提示随机选择工具集
+        - 创建多样化的训练数据
+        - 模拟不同场景下的工具配置
+    
+    采样逻辑：
+        1. 遍历分布中的每个工具集
+        2. 生成 0-100 的随机数，如果小于概率值则选中该工具集
+        3. 如果没有工具集被选中（低概率时可能发生），
+           则选择概率最高的工具集作为保底
     """
     dist = get_distribution(distribution_name)
     if not dist:
@@ -289,24 +326,41 @@ def sample_toolsets_from_distribution(distribution_name: str) -> List[str]:
 
 
 def validate_distribution(distribution_name: str) -> bool:
-    """
-    Check if a distribution name is valid.
+    """检查分布名称是否有效。
     
-    Args:
-        distribution_name (str): Distribution name to validate
-        
-    Returns:
-        bool: True if valid, False otherwise
+    功能概括：
+        验证给定的分布名称是否存在于 DISTRIBUTIONS 字典中。
+    
+    参数：
+        distribution_name: 要验证的分布名称
+    
+    返回值：
+        bool: 如果分布存在返回 True，否则返回 False
+    
+    主要用于：
+        - 用户输入的分布名称验证
+        - 配置文件中的分布名称校验
+        - 采样前的预检查
     """
     return distribution_name in DISTRIBUTIONS
 
 
 def print_distribution_info(distribution_name: str) -> None:
-    """
-    Print detailed information about a distribution.
+    """打印分布的详细信息。
     
-    Args:
-        distribution_name (str): Distribution name
+    功能概括：
+        以用户友好的格式打印分布的描述和工具集概率信息。
+    
+    参数：
+        distribution_name: 要打印信息的分布名称
+    
+    返回值：
+        无（直接打印到控制台）
+    
+    主要用于：
+        - 调试和测试
+        - 显示分布配置详情
+        - CLI 命令的信息展示
     """
     dist = get_distribution(distribution_name)
     if not dist:

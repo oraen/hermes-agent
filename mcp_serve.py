@@ -1,22 +1,21 @@
-"""
-Hermes MCP Server — expose messaging conversations as MCP tools.
+"""Hermes MCP 服务器 — 将消息对话暴露为 MCP 工具。
 
-Starts a stdio MCP server that lets any MCP client (Claude Code, Cursor, Codex,
-etc.) list conversations, read message history, send messages, poll for live
-events, and manage approval requests across all connected platforms.
+启动一个 stdio MCP 服务器，让任何 MCP 客户端（Claude Code、Cursor、Codex 等）
+能够列出对话、读取消息历史、发送消息、轮询实时事件，以及管理所有连接平台的
+审批请求。
 
-Matches OpenClaw's 9-tool MCP channel bridge surface:
+匹配 OpenClaw 的 9 工具 MCP 通道桥接接口：
   conversations_list, conversation_get, messages_read, attachments_fetch,
   events_poll, events_wait, messages_send, permissions_list_open,
   permissions_respond
 
-Plus: channels_list (Hermes-specific extra)
+额外工具：channels_list（Hermes 特有）
 
-Usage:
+使用方式：
     hermes mcp serve
     hermes mcp serve --verbose
 
-MCP client config (e.g. claude_desktop_config.json):
+MCP 客户端配置（如 claude_desktop_config.json）：
     {
         "mcpServers": {
             "hermes": {
@@ -25,6 +24,11 @@ MCP client config (e.g. claude_desktop_config.json):
             }
         }
     }
+
+主要用途：
+    - 让外部 AI 工具（Claude Code、Cursor 等）访问 Hermes 消息对话
+    - 跨平台消息管理（Telegram、Discord、Slack、WhatsApp 等）
+    - 实时事件监听和审批处理
 """
 
 from __future__ import annotations
@@ -60,7 +64,21 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 def _get_sessions_dir() -> Path:
-    """Return the sessions directory using HERMES_HOME."""
+    """返回会话目录路径，使用 HERMES_HOME。
+    
+    功能概括：
+        获取 Hermes 会话存储目录的标准路径。
+    
+    参数：
+        无
+    
+    返回值：
+        Path: 会话目录的绝对路径（{HERMES_HOME}/sessions）
+    
+    主要用于：
+        - 加载会话索引文件
+        - 访问会话会话数据
+    """
     try:
         from hermes_constants import get_hermes_home
         return get_hermes_home() / "sessions"
@@ -69,7 +87,22 @@ def _get_sessions_dir() -> Path:
 
 
 def _get_session_db():
-    """Get a SessionDB instance for reading message transcripts."""
+    """获取 SessionDB 实例以读取消息记录。
+    
+    功能概括：
+        创建并返回 SessionDB 对象，用于访问 SQLite 会话数据库。
+        如果数据库不可用则返回 None。
+    
+    参数：
+        无
+    
+    返回值：
+        SessionDB | None: 会话数据库对象，如果不可用则返回 None
+    
+    主要用于：
+        - 读取消息历史
+        - 查询会话信息
+    """
     try:
         from hermes_state import SessionDB
         return SessionDB()
@@ -79,10 +112,23 @@ def _get_session_db():
 
 
 def _load_sessions_index() -> dict:
-    """Load the gateway sessions.json index directly.
-
-    Returns a dict of session_key -> entry_dict with platform routing info.
-    This avoids importing the full SessionStore which needs GatewayConfig.
+    """直接加载 gateway 的 sessions.json 索引文件。
+    
+    功能概括：
+        读取会话索引文件，返回包含平台路由信息的会话字典。
+        避免导入需要 GatewayConfig 的完整 SessionStore。
+    
+    参数：
+        无
+    
+    返回值：
+        dict: 会话键到会话条目的映射
+             {session_key: {session_id, platform, display_name, ...}}
+    
+    主要用于：
+        - conversations_list() 列出对话
+        - conversation_get() 获取对话详情
+        - 查找会话的平台路由信息
     """
     sessions_file = _get_sessions_dir() / "sessions.json"
     if not sessions_file.exists():
@@ -96,7 +142,22 @@ def _load_sessions_index() -> dict:
 
 
 def _load_channel_directory() -> dict:
-    """Load the cached channel directory for available targets."""
+    """加载缓存的频道目录以获取可用目标。
+    
+    功能概括：
+        读取 channel_directory.json 文件，获取所有可发送消息的频道/目标。
+    
+    参数：
+        无
+    
+    返回值：
+        dict: 频道目录数据，按平台分组
+             {platform: [频道列表]}
+    
+    主要用于：
+        - channels_list() 列出可用频道
+        - messages_send() 解析目标地址
+    """
     try:
         from hermes_constants import get_hermes_home
         directory_file = get_hermes_home() / "channel_directory.json"
@@ -116,7 +177,22 @@ def _load_channel_directory() -> dict:
 
 
 def _extract_message_content(msg: dict) -> str:
-    """Extract text content from a message, handling multi-part content."""
+    """从消息中提取文本内容，处理多部分内容。
+    
+    功能概括：
+        从消息字典中提取纯文本内容，支持处理多部分消息格式
+        （如包含文本、图片混合的消息）。
+    
+    参数：
+        msg: 消息字典，包含 content 字段
+    
+    返回值：
+        str: 提取的文本内容，如果内容为空则返回空字符串
+    
+    主要用于：
+        - messages_read() 中显示消息内容
+        - 事件轮询中提取新消息
+    """
     content = msg.get("content", "")
     if isinstance(content, list):
         text_parts = [
@@ -128,10 +204,25 @@ def _extract_message_content(msg: dict) -> str:
 
 
 def _extract_attachments(msg: dict) -> List[dict]:
-    """Extract non-text attachments from a message.
-
-    Finds: multi-part image/file content blocks, MEDIA: tags in text,
-    image URLs, and file references.
+    """从消息中提取非文本附件。
+    
+    功能概括：
+        查找并提取消息中的附件，包括：
+        - 多部分图片/文件内容块
+        - 文本中的 MEDIA: 标签
+        - 图片 URL
+        - 文件引用
+    
+    参数：
+        msg: 消息字典
+    
+    返回值：
+        List[dict]: 附件列表，每个附件包含 type 和 url/path
+                   [{"type": "image", "url": "..."}, ...]
+    
+    主要用于：
+        - attachments_fetch() 工具实现
+        - 消息附件的显示和处理
     """
     attachments = []
     content = msg.get("content", "")
@@ -183,11 +274,22 @@ class QueueEvent:
 
 
 class EventBridge:
-    """Background poller that watches SessionDB for new messages and
-    maintains an in-memory event queue with waiter support.
-
-    This is the Hermes equivalent of OpenClaw's WebSocket gateway bridge.
-    Instead of WebSocket events, we poll the SQLite database for changes.
+    """后台轮询器，监控 SessionDB 中的新消息并维护内存事件队列。
+    
+    功能概括：
+        这是 Hermes 对 OpenClaw WebSocket 网关桥接的等价实现。
+        不使用 WebSocket 事件，而是轮询 SQLite 数据库以检测变化。
+        维护一个事件队列，支持等待者（waiter）模式。
+    
+    主要用途：
+        - events_poll() 轮询新事件
+        - events_wait() 阻塞等待事件
+        - 实时消息和审批请求的跟踪
+    
+    事件类型：
+        - message: 新消息
+        - approval_requested: 请求审批
+        - approval_resolved: 审批已处理
     """
 
     def __init__(self):
@@ -206,7 +308,20 @@ class EventBridge:
         self._cached_sessions_index: dict = {}
 
     def start(self):
-        """Start the background polling thread."""
+        """启动后台轮询线程。
+        
+        功能概括：
+            启动一个守护线程，开始定期轮询数据库以检测新消息。
+        
+        参数：
+            无
+        
+        返回值：
+            无
+        
+        主要用于：
+            - MCP 服务器启动时初始化事件桥接
+        """
         if self._running:
             return
         self._running = True
@@ -215,7 +330,20 @@ class EventBridge:
         logger.debug("EventBridge started")
 
     def stop(self):
-        """Stop the background polling thread."""
+        """停止后台轮询线程。
+        
+        功能概括：
+            停止轮询并等待线程退出，唤醒任何等待者。
+        
+        参数：
+            无
+        
+        返回值：
+            无
+        
+        主要用于：
+            - MCP 服务器关闭时清理资源
+        """
         self._running = False
         self._new_event.set()  # Wake any waiters
         if self._thread:
@@ -228,7 +356,25 @@ class EventBridge:
         session_key: Optional[str] = None,
         limit: int = 20,
     ) -> dict:
-        """Return events since after_cursor, optionally filtered by session_key."""
+        """返回 after_cursor 之后的事件，可按 session_key 过滤。
+        
+        功能概括：
+            从事件队列中获取指定游标之后的事件，支持按会话过滤和数量限制。
+        
+        参数：
+            after_cursor: 返回此游标之后的事件（0 表示所有）
+            session_key: 可选，过滤到特定会话
+            limit: 最大返回事件数，默认 20
+        
+        返回值：
+            dict: 包含以下键：
+                - events: 事件列表
+                - next_cursor: 下次轮询应使用的游标
+        
+        主要用于：
+            - events_poll MCP 工具的实现
+            - 客户端定期获取新事件
+        """
         with self._lock:
             events = [
                 e for e in self._queue
@@ -252,7 +398,24 @@ class EventBridge:
         session_key: Optional[str] = None,
         timeout_ms: int = 30000,
     ) -> Optional[dict]:
-        """Block until a matching event arrives or timeout expires."""
+        """阻塞直到匹配的事件到达或超时。
+        
+        功能概括：
+            长轮询等待事件，避免频繁轮询的资源浪费。
+            当新事件到达时立即返回，或超时后返回 None。
+        
+        参数：
+            after_cursor: 等待此游标之后的事件
+            session_key: 可选，过滤到特定会话
+            timeout_ms: 最大等待时间（毫秒），默认 30000
+        
+        返回值：
+            dict | None: 匹配的事件字典，超时返回 None
+        
+        主要用于：
+            - events_wait MCP 工具的实现
+            - 近实时事件投递
+        """
         deadline = time.monotonic() + (timeout_ms / 1000.0)
 
         while time.monotonic() < deadline:
@@ -275,7 +438,21 @@ class EventBridge:
         return None
 
     def list_pending_approvals(self) -> List[dict]:
-        """List approval requests observed during this bridge session."""
+        """列出此桥接会话期间观察到的待审批请求。
+        
+        功能概括：
+            返回当前待处理的审批请求列表，按创建时间排序。
+        
+        参数：
+            无
+        
+        返回值：
+            List[dict]: 审批请求列表
+        
+        主要用于：
+            - permissions_list_open MCP 工具的实现
+            - 显示待处理的权限请求
+        """
         with self._lock:
             return sorted(
                 self._pending_approvals.values(),
@@ -283,7 +460,25 @@ class EventBridge:
             )
 
     def respond_to_approval(self, approval_id: str, decision: str) -> dict:
-        """Resolve a pending approval (best-effort without gateway IPC)."""
+        """处理待审批请求（尽最大努力，无网关 IPC）。
+        
+        功能概括：
+            响应一个待处理的审批请求，并将其从待处理列表中移除。
+            由于没有直接的网关 IPC，这是尽力而为的实现。
+        
+        参数：
+            approval_id: 审批请求 ID
+            decision: 决策（"allow-once"、"allow-always"、"deny"）
+        
+        返回值：
+            dict: 处理结果
+                - 成功: {"resolved": True, "approval_id": ..., "decision": ...}
+                - 失败: {"error": "Approval not found: ..."}
+        
+        主要用于：
+            - permissions_respond MCP 工具的实现
+            - 处理危险命令的审批
+        """
         with self._lock:
             approval = self._pending_approvals.pop(approval_id, None)
 

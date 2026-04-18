@@ -1,33 +1,36 @@
 #!/usr/bin/env python3
-"""
-Trajectory Compressor
+"""Hermes Agent 轨迹压缩器。
 
-Post-processes completed agent trajectories to compress them within a target
-token budget while preserving training signal quality.
+后处理已完成的 agent 轨迹，在目标 token 预算内压缩它们，同时保持训练信号质量。
 
-Compression Strategy:
-1. Protect first turns (system, human, first gpt, first tool)
-2. Protect last N turns (final actions and conclusions)
-3. Compress MIDDLE turns only, starting from 2nd tool response
-4. Compress only as much as needed to fit under target
-5. Replace compressed region with a single human summary message
-6. Keep remaining tool calls intact (model continues working after summary)
+压缩策略：
+1. 保护前几个回合（system、human、第一个 gpt、第一个 tool）
+2. 保护最后 N 个回合（最终动作和结论）
+3. 仅压缩中间回合，从第 2 个 tool 响应开始
+4. 仅压缩到刚好符合目标所需的程度
+5. 用单个 human 摘要消息替换压缩区域
+6. 保持剩余 tool 调用完整（模型在摘要后继续工作）
 
-Usage:
-    # Compress a directory of JSONL files
+使用示例：
+    # 压缩目录中的 JSONL 文件
     python trajectory_compressor.py --input=data/my_run
     
-    # Compress a single JSONL file
+    # 压缩单个 JSONL 文件
     python trajectory_compressor.py --input=data/trajectories.jsonl
     
-    # Compress 15% sample of a file
+    # 压缩文件的 15% 样本
     python trajectory_compressor.py --input=data/trajectories.jsonl --sample_percent=15
     
-    # Compress with custom output and token target
+    # 使用自定义输出和 token 目标压缩
     python trajectory_compressor.py --input=data/trajectories.jsonl --output=compressed.jsonl --target_max_tokens=16000
     
-    # Compress 10% sample from a directory
+    # 从目录压缩 10% 样本
     python trajectory_compressor.py --input=data/my_run --sample_percent=10
+
+主要用途：
+    - 减少长轨迹的上下文长度以适应模型限制
+    - 优化训练数据质量（去除冗余中间步骤）
+    - 降低训练成本
 """
 
 import json
@@ -56,7 +59,23 @@ load_hermes_dotenv(hermes_home=_hermes_home, project_env=_project_env)
 
 @dataclass
 class CompressionConfig:
-    """Configuration for trajectory compression."""
+    """轨迹压缩配置。
+    
+    功能概括：
+        存储压缩器的所有配置参数，包括分词器、压缩目标、
+        保护回合设置、摘要生成、输出格式和处理选项。
+        支持从 YAML 文件加载配置。
+    
+    主要用途：
+        - TrajectoryCompressor 初始化时传入配置
+        - main() 函数中从 CLI 参数和 YAML 文件构建配置
+    
+    关键配置项：
+        - target_max_tokens: 目标最大 token 数（默认 15250）
+        - summary_target_tokens: 摘要目标 token 数（默认 750）
+        - protect_last_n_turns: 保护的末尾回合数（默认 4）
+        - max_concurrent_requests: 最大并发 API 调用数（默认 50）
+    """
     # Tokenizer
     tokenizer_name: str = "moonshotai/Kimi-K2-Thinking"
     trust_remote_code: bool = True
@@ -99,7 +118,22 @@ class CompressionConfig:
     
     @classmethod
     def from_yaml(cls, yaml_path: str) -> "CompressionConfig":
-        """Load configuration from YAML file."""
+        """从 YAML 文件加载配置。
+        
+        功能概括：
+            读取 YAML 配置文件，解析各配置节并更新默认配置。
+            支持 tokenizer、compression、protected_turns、summarization、
+            output、processing、metrics 等配置节。
+        
+        参数：
+            yaml_path: YAML 配置文件路径
+        
+        返回值：
+            CompressionConfig: 加载的配置对象
+        
+        主要用于：
+            - main() 函数中从配置文件加载配置
+        """
         with open(yaml_path, 'r') as f:
             data = yaml.safe_load(f)
         
@@ -156,7 +190,23 @@ class CompressionConfig:
 
 @dataclass
 class TrajectoryMetrics:
-    """Metrics for a single trajectory compression."""
+    """单个轨迹压缩的指标。
+    
+    功能概括：
+        记录单个轨迹压缩前后的 token 数、回合数、压缩比例、
+        API 调用次数等详细指标。
+    
+    主要用途：
+        - compress_trajectory() 返回压缩结果时附带指标
+        - AggregateMetrics 聚合所有轨迹的指标
+        - 输出到 compression_metrics.json 供分析
+    
+    关键字段：
+        - original_tokens/compressed_tokens: 压缩前后 token 数
+        - compression_ratio: 压缩比例（压缩后/压缩前）
+        - was_compressed: 是否进行了压缩
+        - still_over_limit: 压缩后是否仍超限
+    """
     original_tokens: int = 0
     compressed_tokens: int = 0
     tokens_saved: int = 0
@@ -201,7 +251,21 @@ class TrajectoryMetrics:
 
 @dataclass 
 class AggregateMetrics:
-    """Aggregate metrics across all trajectories."""
+    """所有轨迹的聚合指标。
+    
+    功能概括：
+        聚合所有轨迹的压缩指标，计算总体统计数据如总 token 节省、
+        平均压缩比例、API 调用成功率等。
+    
+    主要用途：
+        - TrajectoryCompressor 处理目录时累积指标
+        - 最终输出压缩报告
+        - 保存到 metrics JSON 文件
+    
+    关键方法：
+        - add_trajectory_metrics(): 添加单个轨迹的指标
+        - to_dict(): 转换为字典格式用于输出
+    """
     total_trajectories: int = 0
     trajectories_compressed: int = 0
     trajectories_skipped_under_target: int = 0
@@ -305,19 +369,46 @@ class AggregateMetrics:
 
 
 class TrajectoryCompressor:
-    """
-    Compresses agent trajectories to fit within a target token budget.
+    """压缩 agent 轨迹以适应目标 token 预算。
     
-    Compression strategy:
-    1. Keep protected head turns (system, human, first gpt+tool)
-    2. Keep protected tail turns (last N turns)
-    3. From the compressible middle region, compress only as much as needed
-    4. Replace compressed turns with a single human summary message
-    5. Keep remaining middle turns intact (model continues with tools)
+    功能概括：
+        实现轨迹压缩的核心逻辑：
+        1. 保持受保护的头部回合（system、human、第一个 gpt+tool）
+        2. 保持受保护的尾部回合（最后 N 个回合）
+        3. 从可压缩的中间区域，仅压缩所需的部分
+        4. 用单个 human 摘要消息替换压缩的回合
+        5. 保持剩余的中间回合完整（模型继续使用工具）
+    
+    主要用途：
+        - main() 函数中处理单个文件或目录
+        - 批量压缩训练数据
+        - 优化长轨迹的上下文长度
+    
+    压缩算法：
+        1. 计算总 token 数
+        2. 如果低于目标，跳过
+        3. 找到可压缩区域（受保护的头部和尾部之间）
+        4. 计算需要保存的 token 数
+        5. 从可压缩区域开始累积回合，直到满足节省需求
+        6. 用 LLM 生成摘要替换累积的回合
+        7. 保持剩余回合完整
     """
     
     def __init__(self, config: CompressionConfig):
-        """Initialize the compressor."""
+        """初始化压缩器。
+        
+        功能概括：
+            配置压缩器，初始化分词器和摘要生成客户端。
+        
+        参数：
+            config: 压缩配置对象
+        
+        返回值：
+            无
+        
+        主要用于：
+            - main() 函数中创建压缩器实例
+        """
         self.config = config
         self.aggregate_metrics = AggregateMetrics()
         
@@ -335,7 +426,23 @@ class TrajectoryCompressor:
         self.logger = logging.getLogger(__name__)
     
     def _init_tokenizer(self):
-        """Initialize HuggingFace tokenizer for token counting."""
+        """初始化 HuggingFace 分词器用于 token 计数。
+        
+        功能概括：
+            加载指定的预训练分词器，用于准确计算文本 token 数。
+        
+        参数：
+            无
+        
+        返回值：
+            无（设置 self.tokenizer）
+        
+        主要用于：
+            - __init__() 中初始化分词器
+        
+        错误处理：
+            - 分词器加载失败时抛出 RuntimeError
+        """
         try:
             from transformers import AutoTokenizer
             self.tokenizer = AutoTokenizer.from_pretrained(
@@ -347,11 +454,24 @@ class TrajectoryCompressor:
             raise RuntimeError(f"Failed to load tokenizer '{self.config.tokenizer_name}': {e}")
     
     def _init_summarizer(self):
-        """Initialize LLM routing for summarization (sync and async).
+        """初始化 LLM 路由用于摘要生成（同步和异步）。
 
-        Uses call_llm/async_call_llm from the centralized provider router
-        which handles auth, headers, and provider detection internally.
-        For custom endpoints, falls back to raw client construction.
+        功能概括：
+            配置摘要生成的 LLM 客户端，支持集中式提供商路由器
+            或自定义端点。处理认证、headers 和提供商检测。
+        
+        参数：
+            无
+        
+        返回值：
+            无（设置 self.client、self._use_call_llm 等）
+        
+        主要用于：
+            - __init__() 中初始化摘要客户端
+        
+        客户端选择：
+            - 已知提供商（OpenRouter、Nous 等）：使用 call_llm/async_call_llm
+            - 自定义端点：直接构造 OpenAI 客户端
         """
 
         provider = self._detect_provider()
@@ -408,7 +528,20 @@ class TrajectoryCompressor:
         return self.async_client
 
     def _detect_provider(self) -> str:
-        """Detect the provider name from the configured base_url."""
+        """从配置的 base_url 检测提供商名称。
+        
+        功能概括：
+            根据 base_url 识别 LLM 提供商（如 openrouter、nous 等）。
+        
+        参数：
+            无
+        
+        返回值：
+            str: 提供商名称，未知返回空字符串
+        
+        主要用于：
+            - _init_summarizer() 中确定使用哪种客户端
+        """
         url = (self.config.base_url or "").lower()
         if "openrouter" in url:
             return "openrouter"
@@ -430,7 +563,22 @@ class TrajectoryCompressor:
         return ""
     
     def count_tokens(self, text: str) -> int:
-        """Count tokens in text using the configured tokenizer."""
+        """使用配置的分词器计算文本中的 token 数。
+        
+        功能概括：
+            调用分词器的 encode 方法计算 token 数。
+            如果失败则回退到字符数估算（每 4 个字符约 1 个 token）。
+        
+        参数：
+            text: 要计算 token 的文本
+        
+        返回值：
+            int: token 数量
+        
+        主要用于：
+            - count_trajectory_tokens() 计算轨迹总 token
+            - count_turn_tokens() 计算每个回合的 token
+        """
         if not text:
             return 0
         try:
@@ -440,11 +588,37 @@ class TrajectoryCompressor:
             return len(text) // 4
     
     def count_trajectory_tokens(self, trajectory: List[Dict[str, str]]) -> int:
-        """Count total tokens in a trajectory."""
+        """计算轨迹中的总 token 数。
+        
+        功能概括：
+            遍历轨迹的所有回合，累加每个回合的 token 数。
+        
+        参数：
+            trajectory: 轨迹消息列表
+        
+        返回值：
+            int: 总 token 数
+        
+        主要用于：
+            - compress_trajectory() 判断是否需要压缩
+        """
         return sum(self.count_tokens(turn.get("value", "")) for turn in trajectory)
     
     def count_turn_tokens(self, trajectory: List[Dict[str, str]]) -> List[int]:
-        """Count tokens for each turn in a trajectory."""
+        """计算轨迹中每个回合的 token 数。
+        
+        功能概括：
+            返回每个回合的 token 数列表，用于确定压缩哪些回合。
+        
+        参数：
+            trajectory: 轨迹消息列表
+        
+        返回值：
+            List[int]: 每个回合的 token 数列表
+        
+        主要用于：
+            - compress_trajectory() 中确定压缩区域
+        """
         return [self.count_tokens(turn.get("value", "")) for turn in trajectory]
     
     def _find_protected_indices(self, trajectory: List[Dict[str, str]]) -> Tuple[set, int, int]:

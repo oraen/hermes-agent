@@ -1,16 +1,32 @@
 #!/usr/bin/env python3
 """
-Hermes Agent CLI - Interactive Terminal Interface
+Hermes Agent CLI - 交互式终端界面
 
-A beautiful command-line interface for the Hermes Agent, inspired by Claude Code.
-Features ASCII art branding, interactive REPL, toolset selection, and rich formatting.
+一个美观的命令行界面，用于 Hermes Agent，灵感来自 Claude Code。
+功能包括 ASCII 艺术品牌、交互式 REPL、工具集选择和丰富的格式化。
 
-Usage:
-    python cli.py                          # Start interactive mode with all tools
-    python cli.py --toolsets web,terminal  # Start with specific toolsets
+功能特性:
+- 基于 prompt_toolkit 的富文本 TUI 界面
+- 交互式 REPL，支持命令历史和自动补全
+- 工具集选择和配置管理
+- 流式输出显示
+- 会话管理和搜索
+- 斜杠命令系统（/help、/model、/skills 等）
+- 皮肤/主题系统
+- 后台进程管理
+
+使用场景:
+- 开发者本地使用：提供终端交互式 AI 编程助手
+- 项目级配置：通过 cli-config.yaml 配置项目特定设置
+- 批量查询：使用 -q 参数进行单次查询
+- 工具浏览：使用 --list-tools 查看可用工具
+
+用法示例:
+    python cli.py                          # 启动交互模式，启用所有工具
+    python cli.py --toolsets web,terminal  # 启动时指定工具集
     python cli.py --skills hermes-agent-dev,github-auth
-    python cli.py -q "your question"       # Single query mode
-    python cli.py --list-tools             # List available tools and exit
+    python cli.py -q "你的问题"             # 单次查询模式
+    python cli.py --list-tools             # 列出可用工具并退出
 """
 
 import logging
@@ -1588,11 +1604,57 @@ def save_config_value(key_path: str, value: any) -> bool:
 # ============================================================================
 
 class HermesCLI:
-    """
-    Interactive CLI for the Hermes Agent.
-    
-    Provides a REPL interface with rich formatting, command history,
-    and tool execution capabilities.
+    """Hermes Agent 交互式 CLI 主类。
+
+    功能概括:
+    - 提供完整的 REPL（Read-Eval-Print Loop）交互界面
+    - 集成 prompt_toolkit 实现富文本 TUI，支持多行输入、命令历史和自动补全
+    - 管理 AIAgent 实例的生命周期（延迟初始化、配置传递）
+    - 处理斜杠命令系统（/help、/model、/skills、/tools、/clear 等）
+    - 实现流式输出显示和进度反馈
+    - 管理会话历史和 SQLite 持久化
+    - 支持皮肤/主题系统，自定义 CLI 外观
+    - 集成后台进程管理和通知
+    - 支持会话恢复和检查点
+
+    主要使用场景:
+    1. 开发者本地编程助手：提供终端交互式 AI 编程支持
+    2. 项目级 AI 配置：通过 cli-config.yaml 管理项目特定设置
+    3. 工具浏览和测试：查看和测试各种工具的功能
+    4. 会话管理：保存、恢复、搜索历史对话
+
+    核心组件:
+    - prompt_toolkit Application：负责 TUI 渲染和输入处理
+    - AIAgent：智能体核心，处理对话和工具调用
+    - SessionDB：SQLite 会话存储，支持 FTS5 全文搜索
+    - 斜杠命令系统：COMMAND_REGISTRY 定义所有可用命令
+    - 皮肤引擎：skin_engine.py 提供主题支持
+
+    工作流程:
+    1. 初始化：加载配置、解析 CLI 参数、初始化组件
+    2. 启动 REPL：显示 banner、等待用户输入
+    3. 处理输入：
+       - 如果是斜杠命令，分发到对应处理器
+       - 如果是普通消息，传递给 AIAgent.run_conversation()
+    4. 显示输出：流式显示模型响应和工具执行结果
+    5. 循环：返回步骤 2，直到用户退出
+
+    示例用法:
+        # 启动 CLI
+        cli = HermesCLI(model="anthropic/claude-sonnet-4.6")
+        cli.run()
+
+        # 带工具集限制
+        cli = HermesCLI(
+            model="anthropic/claude-sonnet-4.6",
+            toolsets=["web", "terminal"],
+            max_turns=50
+        )
+        cli.run()
+
+        # 恢复之前的会话
+        cli = HermesCLI(resume="session-id-here")
+        cli.run()
     """
     
     def __init__(
@@ -1609,20 +1671,32 @@ class HermesCLI:
         checkpoints: bool = False,
         pass_session_id: bool = False,
     ):
-        """
-        Initialize the Hermes CLI.
+        """初始化 Hermes CLI。
 
-        Args:
-            model: Model to use (default: from env or claude-sonnet)
-            toolsets: List of toolsets to enable (default: all)
-            provider: Inference provider ("auto", "openrouter", "nous", "openai-codex", "zai", "kimi-coding", "minimax", "minimax-cn")
-            api_key: API key (default: from environment)
-            base_url: API base URL (default: OpenRouter)
-            max_turns: Maximum tool-calling iterations shared with subagents (default: 90)
-            verbose: Enable verbose logging
-            compact: Use compact display mode
-            resume: Session ID to resume (restores conversation history from SQLite)
-            pass_session_id: Include the session ID in the agent's system prompt
+        参数介绍:
+            model (str): 使用的模型（默认：来自环境变量或 claude-sonnet）
+            toolsets (List[str]): 要启用的工具集列表（默认：全部）
+            provider (str): 推理提供商（"auto", "openrouter", "nous", "openai-codex", "zai", "kimi-coding", "minimax", "minimax-cn"）
+            api_key (str): API 密钥（默认：从环境变量获取）
+            base_url (str): API 基础 URL（默认：OpenRouter）
+            max_turns (int): 与子智能体共享的最大工具调用迭代次数（默认：90）
+            verbose (bool): 启用详细日志
+            compact (bool): 使用紧凑显示模式
+            resume (str): 要恢复的会话 ID（从 SQLite 恢复对话历史）
+            checkpoints (bool): 启用文件系统检查点（默认：False）
+            pass_session_id (bool): 在智能体的系统提示中包含会话 ID
+
+        配置优先级:
+            1. CLI 参数（最高优先级）
+            2. 环境变量
+            3. 配置文件（~/.hermes/config.yaml 或 ./cli-config.yaml）
+
+        使用场景:
+            1. 基础启动: HermesCLI()
+            2. 指定模型: HermesCLI(model="anthropic/claude-opus-4.6")
+            3. 限制工具: HermesCLI(toolsets=["web", "terminal"])
+            4. 恢复会话: HermesCLI(resume="session-id")
+            5. 详细模式: HermesCLI(verbose=True)
         """
         # Initialize Rich console
         self.console = Console()
@@ -5350,14 +5424,43 @@ class HermesCLI:
             print()
     
     def process_command(self, command: str) -> bool:
-        """
-        Process a slash command.
-        
-        Args:
-            command: The command string (starting with /)
-            
-        Returns:
-            bool: True to continue, False to exit
+        """处理斜杠命令。
+
+        功能概括:
+        - 解析和执行用户输入的斜杠命令（例如 /help、/model、/clear）
+        - 支持命令别名，通过中央注册表解析
+        - 处理会话管理、配置修改、工具集切换等
+        - 返回 False 表示退出，True 表示继续
+
+        参数介绍:
+            command (str): 命令字符串（以 / 开头）
+
+        返回值:
+            bool: True 继续运行，False 退出 CLI
+
+        支持的命令:
+            - /quit, /exit, /q: 退出 CLI
+            - /help: 显示帮助信息
+            - /model: 切换模型
+            - /clear: 清空对话历史
+            - /title: 设置会话标题
+            - /skills: 管理技能
+            - /tools: 管理工具
+            - /memory: 内存管理
+            - /gateway: 网关状态
+            - /cron: 定时任务管理
+            - /skin: 切换皮肤/主题
+            - /compact: 切换紧凑模式
+            - /stream: 切换流式输出
+            - 等等...
+
+        使用场景:
+            用户在 CLI 交互界面中输入斜杠命令来控制和配置智能体
+
+        示例:
+            cli.process_command("/help")        # 显示帮助
+            cli.process_command("/model gpt-4") # 切换模型
+            cli.process_command("/clear")       # 清空历史
         """
         # Lowercase only for dispatch matching; preserve original case for arguments
         cmd_lower = command.lower().strip()
@@ -8385,7 +8488,53 @@ class HermesCLI:
         ]
 
     def run(self):
-        """Run the interactive CLI loop with persistent input at bottom."""
+        """运行交互式 CLI 循环，底部持续输入区域。
+
+        功能概括:
+        - 这是 HermesCLI 的主入口点，启动完整的 REPL 交互循环
+        - 初始化 prompt_toolkit Application，配置 TUI 布局和键绑定
+        - 处理用户输入、斜杠命令、智能体响应
+        - 管理异步操作（智能体运行、后台进程、流式输出）
+        - 处理各种 UI 状态（clarify、sudo、approval、secret 等模态对话框）
+        - 支持语音模式、剪贴板图片、配置文件热重载
+
+        使用场景:
+            1. 启动 CLI 交互界面：cli = HermesCLI(); cli.run()
+            2. 作为 hermes 命令的默认行为：用户运行 `hermes` 时调用
+            3. 项目级 AI 助手：开发者在项目目录中启动
+
+        工作流程:
+            1. 初始化：显示 banner、欢迎消息、提示信息
+            2. 恢复会话（如果指定）：加载历史并显示
+            3. 设置状态：初始化队列、锁、回调函数
+            4. 启动 prompt_toolkit Application：
+               a. 渲染 TUI 布局（输入区域、状态栏、输出区域）
+               b. 处理键盘事件（Enter、Ctrl+C、Tab 等）
+               c. 根据当前 UI 状态路由输入
+            5. 处理循环：
+               - 如果智能体空闲：处理新输入（命令或消息）
+               - 如果智能体运行：收集中断消息
+            6. 清理：保存会话、关闭连接、退出
+
+        支持的 UI 状态:
+            - 正常输入：普通消息或斜杠命令
+            - Clarify 选择：智能体请求用户选择
+            - Sudo 密码：终端工具需要 sudo 密码
+            - Approval 确认：危险命令需要用户确认
+            - Secret 捕获：技能设置需要捕获密钥
+            - 语音模式：录音和 STT 处理
+
+        键盘绑定:
+            - Enter: 提交输入
+            - Ctrl+C: 中断当前操作（双击强制退出）
+            - Tab: 自动补全
+            - Ctrl+D: 退出
+            - 等等...
+
+        示例:
+            cli = HermesCLI(model="anthropic/claude-sonnet-4.6")
+            cli.run()  # 启动交互循环
+        """
         # Push the entire TUI to the bottom of the terminal so the banner,
         # responses, and prompt all appear pinned to the bottom — empty
         # space stays above, not below.  This prints enough blank lines to
@@ -10115,38 +10264,55 @@ def main(
     checkpoints: bool = False,
     pass_session_id: bool = False,
 ):
-    """
-    Hermes Agent CLI - Interactive AI Assistant
-    
-    Args:
-        query: Single query to execute (then exit). Alias: -q
-        q: Shorthand for --query
-        image: Optional local image path to attach to a single query
-        toolsets: Comma-separated list of toolsets to enable (e.g., "web,terminal")
-        skills: Comma-separated or repeated list of skills to preload for the session
-        model: Model to use (default: anthropic/claude-opus-4-20250514)
-        provider: Inference provider ("auto", "openrouter", "nous", "openai-codex", "zai", "kimi-coding", "minimax", "minimax-cn")
-        api_key: API key for authentication
-        base_url: Base URL for the API
-        max_turns: Maximum tool-calling iterations (default: 60)
-        verbose: Enable verbose logging
-        compact: Use compact display mode
-        list_tools: List available tools and exit
-        list_toolsets: List available toolsets and exit
-        resume: Resume a previous session by its ID (e.g., 20260225_143052_a1b2c3)
-        worktree: Run in an isolated git worktree (for parallel agents). Alias: -w
-        w: Shorthand for --worktree
-    
-    Examples:
-        python cli.py                            # Start interactive mode
-        python cli.py --toolsets web,terminal    # Use specific toolsets
+    """Hermes Agent CLI 主入口点。
+
+    功能概括:
+    - 这是 `hermes` 命令的入口函数，通过 fire 库解析 CLI 参数
+    - 支持交互模式、单次查询模式、工具列表模式、网关模式
+    - 处理 git worktree 隔离、会话恢复、技能和工具集加载
+    - 初始化 HermesCLI 实例并启动交互循环
+
+    参数介绍:
+        query (str): 要执行的单次查询（然后退出）。别名：-q
+        q (str): --query 的简写
+        image (str): 要附加到单次查询的本地图片路径
+        toolsets (str): 要启用的工具集列表，逗号分隔（例如 "web,terminal"）
+        skills (str|list|tuple): 为此会话预加载的技能列表，逗号分隔或重复参数
+        model (str): 使用的模型（默认：anthropic/claude-opus-4-20250514）
+        provider (str): 推理提供商（"auto", "openrouter", "nous", "openai-codex", "zai", "kimi-coding", "minimax", "minimax-cn"）
+        api_key (str): API 认证密钥
+        base_url (str): API 基础 URL
+        max_turns (int): 最大工具调用迭代次数（默认：60）
+        verbose (bool): 启用详细日志
+        quiet (bool): 安静模式
+        compact (bool): 使用紧凑显示模式
+        list_tools (bool): 列出可用工具并退出
+        list_toolsets (bool): 列出可用工具集并退出
+        gateway (bool): 启动网关模式（消息平台 + 定时任务）
+        resume (str): 通过 ID 恢复之前的会话（例如 20260225_143052_a1b2c3）
+        worktree (bool): 在隔离的 git worktree 中运行（用于并行智能体）。别名：-w
+        w (bool): --worktree 的简写
+        checkpoints (bool): 启用文件系统检查点
+        pass_session_id (bool): 将会话 ID 传递给智能体的系统提示
+
+    使用场景:
+        1. 交互模式：python cli.py 或 hermes
+        2. 单次查询：python cli.py -q "什么是 Python?"
+        3. 工具浏览：python cli.py --list-tools
+        4. 网关启动：python cli.py --gateway
+        5. 会话恢复：python cli.py --resume 20260225_143052_a1b2c3
+        6. 并行智能体：python cli.py -w -q "修复问题 #123"
+
+    示例:
+        python cli.py                            # 启动交互模式
+        python cli.py --toolsets web,terminal    # 使用特定工具集
         python cli.py --skills hermes-agent-dev,github-auth
-        python cli.py -q "What is Python?"       # Single query mode
-        python cli.py -q "Describe this" --image ~/storage/shared/Pictures/cat.png
-        python cli.py --list-tools               # List tools and exit
-        python cli.py --resume 20260225_143052_a1b2c3  # Resume session
-        python cli.py -w                         # Start in isolated git worktree
-        python cli.py -w -q "Fix issue #123"     # Single query in worktree
+        python cli.py -q "什么是 Python?"        # 单次查询模式
+        python cli.py -q "描述这个" --image ~/cat.png
+        python cli.py --list-tools               # 列出工具并退出
+        python cli.py --resume 20260225_143052_a1b2c3  # 恢复会话
+        python cli.py -w                         # 在隔离的 git worktree 中启动
+        python cli.py -w -q "修复问题 #123"      # 在 worktree 中单次查询
     """
     global _active_worktree
 

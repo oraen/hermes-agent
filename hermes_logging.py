@@ -1,26 +1,41 @@
-"""Centralized logging setup for Hermes Agent.
+"""Hermes Agent 集中式日志系统。
 
-Provides a single ``setup_logging()`` entry point that both the CLI and
-gateway call early in their startup path.  All log files live under
-``~/.hermes/logs/`` (profile-aware via ``get_hermes_home()``).
+提供单一的 ``setup_logging()`` 入口点，CLI 和网关在启动路径早期调用。
+所有日志文件位于 ``~/.hermes/logs/``（通过 ``get_hermes_home()`` 支持 profile）。
 
-Log files produced:
-    agent.log   — INFO+, all agent/tool/session activity (the main log)
-    errors.log  — WARNING+, errors and warnings only (quick triage)
-    gateway.log — INFO+, gateway-only events (created when mode="gateway")
+功能特性:
+- 多日志文件分离（agent.log、errors.log、gateway.log）
+- RotatingFileHandler 自动轮转，防止日志文件过大
+- RedactingFormatter 自动脱敏，确保密钥不写入磁盘
+- 组件分离：gateway.log 只接收 gateway.* 日志
+- 会话上下文：每条日志包含 [session_id] 标签，便于过滤和关联
+- 抑制第三方噪声日志（openai、httpx、urllib3 等）
 
-All files use ``RotatingFileHandler`` with ``RedactingFormatter`` so
-secrets are never written to disk.
+日志文件:
+    agent.log   — INFO+ 级别，所有智能体/工具/会话活动（主日志）
+    errors.log  — WARNING+ 级别，仅错误和警告（快速排查）
+    gateway.log — INFO+ 级别，仅网关事件（mode="gateway" 时创建）
 
-Component separation:
-    gateway.log only receives records from ``gateway.*`` loggers —
-    platform adapters, session management, slash commands, delivery.
-    agent.log remains the catch-all (everything goes there).
+使用场景:
+1. CLI 模式：记录智能体活动、工具执行、会话管理
+2. 网关模式：额外记录网关事件（平台适配器、消息传递等）
+3. 调试模式：--verbose 参数启用 DEBUG 级别控制台输出
+4. 会话追踪：通过 session_id 标签关联同一对话的日志
+5. 日志搜索：hermes logs 命令支持按会话、组件过滤
 
-Session context:
-    Call ``set_session_context(session_id)`` at the start of a conversation
-    and ``clear_session_context()`` when done.  All log lines emitted on
-    that thread will include ``[session_id]`` for filtering/correlation.
+示例:
+    from hermes_logging import setup_logging, set_session_context
+    
+    # 启动时初始化
+    log_dir = setup_logging(mode="cli")
+    
+    # 对话开始时设置会话上下文
+    set_session_context("session-id-123")
+    
+    # 所有日志自动包含 [session-id-123] 标签
+    import logging
+    logger = logging.getLogger(__name__)
+    logger.info("Starting conversation")  # 输出: ... [session-id-123] Starting conversation
 """
 
 import logging
@@ -70,16 +85,30 @@ _NOISY_LOGGERS = (
 # ---------------------------------------------------------------------------
 
 def set_session_context(session_id: str) -> None:
-    """Set the session ID for the current thread.
+    """为当前线程设置会话 ID。
 
-    All subsequent log records on this thread will include ``[session_id]``
-    in the formatted output.  Call at the start of ``run_conversation()``.
+    功能:
+    - 设置后，该线程上的所有后续日志记录都会包含 ``[session_id]``
+    - 在 ``run_conversation()`` 开始时调用
+    - 使用 thread-local 存储，不同线程互不干扰
+
+    参数:
+        session_id (str): 会话唯一标识符
+
+    使用场景: 每次对话开始时调用，使日志可以按会话过滤和关联
+
+    示例:
+        from hermes_logging import set_session_context
+        set_session_context("20260418_143052_a1b2c3")
     """
     _session_context.session_id = session_id
 
 
 def clear_session_context() -> None:
-    """Clear the session ID for the current thread."""
+    """清除当前线程的会话 ID。
+
+    使用场景: 对话结束时调用，清除会话上下文
+    """
     _session_context.session_id = None
 
 
@@ -162,37 +191,51 @@ def setup_logging(
     mode: Optional[str] = None,
     force: bool = False,
 ) -> Path:
-    """Configure the Hermes logging subsystem.
+    """配置 Hermes 日志子系统。
 
-    Safe to call multiple times — the second call is a no-op unless
-    *force* is ``True``.
+    功能概括:
+    - 创建日志目录和多个日志文件处理器
+    - 配置日志轮转（RotatingFileHandler）
+    - 应用脱敏格式化器（RedactingFormatter）
+    - 抑制第三方噪声日志
+    - 支持 CLI、网关、定时任务不同模式
 
-    Parameters
-    ----------
-    hermes_home
-        Override for the Hermes home directory.  Falls back to
-        ``get_hermes_home()`` (profile-aware).
-    log_level
-        Minimum level for the ``agent.log`` file handler.  Accepts any
-        standard Python level name (``"DEBUG"``, ``"INFO"``, ``"WARNING"``).
-        Defaults to ``"INFO"`` or the value from config.yaml ``logging.level``.
-    max_size_mb
-        Maximum size of each log file in megabytes before rotation.
-        Defaults to 5 or the value from config.yaml ``logging.max_size_mb``.
-    backup_count
-        Number of rotated backup files to keep.
-        Defaults to 3 or the value from config.yaml ``logging.backup_count``.
-    mode
-        Caller context: ``"cli"``, ``"gateway"``, ``"cron"``.
-        When ``"gateway"``, an additional ``gateway.log`` file is created
-        that receives only gateway-component records.
-    force
-        Re-run setup even if it has already been called.
+    参数:
+        hermes_home (Path): Hermes 主目录覆盖（默认使用 get_hermes_home()，支持 profile）
+        log_level (str): agent.log 文件处理器的最低级别（默认："INFO" 或 config.yaml 中的 logging.level）
+        max_size_mb (int): 每个日志文件的最大大小（MB），超过后轮转（默认：5 或 config.yaml 中的 logging.max_size_mb）
+        backup_count (int): 保留的轮转备份文件数量（默认：3 或 config.yaml 中的 logging.backup_count）
+        mode (str): 调用者上下文："cli"、"gateway"、"cron"
+                   当为 "gateway" 时，会额外创建 gateway.log 文件，只接收网关组件记录
+        force (bool): 即使已经调用过也重新设置
 
-    Returns
-    -------
-    Path
-        The ``logs/`` directory where files are written.
+    返回值:
+        Path: 日志文件写入的 logs/ 目录
+
+    日志文件:
+        - agent.log: INFO+ 级别，所有活动（主日志）
+        - errors.log: WARNING+ 级别，仅错误和警告
+        - gateway.log: INFO+ 级别，仅网关事件（mode="gateway" 时）
+
+    使用场景:
+        1. CLI 启动: setup_logging(mode="cli")
+        2. 网关启动: setup_logging(mode="gateway")
+        3. 自定义配置: setup_logging(log_level="DEBUG", max_size_mb=10)
+        4. 强制重新设置: setup_logging(force=True)
+
+    示例:
+        from hermes_logging import setup_logging
+        
+        # 基础用法
+        log_dir = setup_logging(mode="cli")
+        
+        # 自定义配置
+        log_dir = setup_logging(
+            mode="gateway",
+            log_level="DEBUG",
+            max_size_mb=10,
+            backup_count=5
+        )
     """
     global _logging_initialized
     if _logging_initialized and not force:
@@ -261,9 +304,19 @@ def setup_logging(
 
 
 def setup_verbose_logging() -> None:
-    """Enable DEBUG-level console logging for ``--verbose`` / ``-v`` mode.
+    """为 ``--verbose`` / ``-v`` 模式启用 DEBUG 级别控制台日志。
 
-    Called by ``AIAgent.__init__()`` when ``verbose_logging=True``.
+    功能:
+    - 添加 StreamHandler 到根日志器
+    - 设置根日志器级别为 DEBUG
+    - 保持第三方库在 WARNING 级别以减少噪声
+    - 避免重复添加处理器
+
+    使用场景: AIAgent.__init__() 中 verbose_logging=True 时调用
+
+    示例:
+        from hermes_logging import setup_verbose_logging
+        setup_verbose_logging()  # 启用详细日志
     """
     from agent.redact import RedactingFormatter
 

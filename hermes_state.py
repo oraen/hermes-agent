@@ -1,17 +1,39 @@
 #!/usr/bin/env python3
 """
-SQLite State Store for Hermes Agent.
+Hermes Agent SQLite 状态存储。
 
-Provides persistent session storage with FTS5 full-text search, replacing
-the per-session JSONL file approach. Stores session metadata, full message
-history, and model configuration for CLI and gateway sessions.
+提供持久化的会话存储，支持 FTS5 全文搜索，替代了每个会话的 JSONL 文件方法。
+存储会话元数据、完整消息历史和模型配置，用于 CLI 和网关会话。
 
-Key design decisions:
-- WAL mode for concurrent readers + one writer (gateway multi-platform)
-- FTS5 virtual table for fast text search across all session messages
-- Compression-triggered session splitting via parent_session_id chains
-- Batch runner and RL trajectories are NOT stored here (separate systems)
-- Session source tagging ('cli', 'telegram', 'discord', etc.) for filtering
+功能特性:
+- WAL 模式支持并发读取 + 单一写入（网关多平台场景）
+- FTS5 虚拟表用于快速文本搜索所有会话消息
+- 压缩触发的会话分割，通过 parent_session_id 链实现
+- 批量运行器和 RL 轨迹不存储在此（独立系统）
+- 会话源标记（'cli', 'telegram', 'discord' 等）用于过滤
+
+使用场景:
+1. CLI 会话管理：保存和恢复对话历史
+2. 网关门面：跨平台会话持久化
+3. 全文搜索：快速查找历史对话内容
+4. 会话统计：token 使用量、成本统计
+5. 会话 lineage：压缩和子智能体产生的会话链
+
+数据库结构:
+- sessions 表：会话元数据（模型、token、成本、标题等）
+- messages 表：完整消息历史（角色、内容、工具调用、推理等）
+- messages_fts 表：FTS5 全文搜索索引
+
+示例:
+    from hermes_state import SessionDB
+    
+    db = SessionDB()
+    db.create_session("session-id", "cli", model="anthropic/claude-sonnet-4.6")
+    db.append_message("session-id", "user", "你好！")
+    messages = db.get_messages("session-id")
+    
+    # 全文搜索
+    results = db.search_messages("docker deployment")
 """
 
 import json
@@ -113,11 +135,53 @@ END;
 
 
 class SessionDB:
-    """
-    SQLite-backed session storage with FTS5 search.
+    """基于 SQLite 的会话存储，支持 FTS5 搜索。
 
-    Thread-safe for the common gateway pattern (multiple reader threads,
-    single writer via WAL mode). Each method opens its own cursor.
+    功能概括:
+    - 提供完整的会话生命周期管理（创建、结束、恢复）
+    - 消息存储和检索（追加、加载、格式转换）
+    - FTS5 全文搜索（支持关键词、短语、布尔查询、前缀匹配）
+    - 会话标题管理（设置、查询、唯一性约束、lineage 追踪）
+    - Token 和成本统计（累计更新、绝对值设置）
+    - 会话导出和清理（导出、删除、修剪）
+
+    线程安全:
+    - 适用于常见的网关模式（多个读取线程，WAL 模式下的单一写入）
+    - 每个方法打开自己的游标
+    - 使用 threading.Lock 保护写入操作
+    - 应用层重试机制，带随机抖动，避免写入冲突
+
+    主要使用场景:
+    1. CLI 会话：保存和恢复交互式对话
+    2. 网关门面：跨 Telegram/Discord/Slack 的会话持久化
+    3. 会话搜索：通过 FTS5 快速查找历史消息
+    4. 成本追踪：记录 token 使用量和 API 成本
+    5. 会话管理：标题、统计、导出、清理
+
+    性能优化:
+    - WAL 模式：并发读取不阻塞
+    - 随机抖动重试：避免写入冲突的 convoy 效应
+    - 定期 WAL checkpoint：防止 WAL 文件无限增长
+    - 关联子查询：避免 N+2 查询问题
+
+    示例:
+        db = SessionDB()
+        
+        # 创建会话
+        db.create_session("session-id", "cli", model="anthropic/claude-sonnet-4.6")
+        
+        # 添加消息
+        db.append_message("session-id", "user", "你好！")
+        db.append_message("session-id", "assistant", "你好！有什么可以帮助你的？")
+        
+        # 加载消息
+        messages = db.get_messages("session-id")
+        
+        # 搜索消息
+        results = db.search_messages("docker deployment")
+        
+        # 设置标题
+        db.set_session_title("session-id", "Docker 部署问题")
     """
 
     # ── Write-contention tuning ──
@@ -162,19 +226,21 @@ class SessionDB:
     # ── Core write helper ──
 
     def _execute_write(self, fn: Callable[[sqlite3.Connection], T]) -> T:
-        """Execute a write transaction with BEGIN IMMEDIATE and jitter retry.
+        """执行写入事务，使用 BEGIN IMMEDIATE 和抖动重试。
 
-        *fn* receives the connection and should perform INSERT/UPDATE/DELETE
-        statements.  The caller must NOT call ``commit()`` — that's handled
-        here after *fn* returns.
+        功能概括:
+        - 在事务开始时获取 WAL 写锁（而非提交时）
+        - 遇到锁冲突时，释放 Python 锁，随机休眠 20-150ms 后重试
+        - 打破 SQLite 内置确定性退避创建的 convoy 模式
+        
+        参数:
+            fn: 接收连接并执行 INSERT/UPDATE/DELETE 语句的函数
+                调用者不应调用 commit()，这里会在 fn 返回后处理
+        
+        返回值:
+            T: fn 的返回值
 
-        BEGIN IMMEDIATE acquires the WAL write lock at transaction start
-        (not at commit time), so lock contention surfaces immediately.
-        On ``database is locked``, we release the Python lock, sleep a
-        random 20-150ms, and retry — breaking the convoy pattern that
-        SQLite's built-in deterministic backoff creates.
-
-        Returns whatever *fn* returns.
+        使用场景: 所有写操作的统一入口，确保并发安全
         """
         last_err: Optional[Exception] = None
         for attempt in range(self._WRITE_MAX_RETRIES):
@@ -235,10 +301,13 @@ class SessionDB:
             pass  # Best effort — never fatal.
 
     def close(self):
-        """Close the database connection.
+        """关闭数据库连接。
 
-        Attempts a PASSIVE WAL checkpoint first so that exiting processes
-        help keep the WAL file from growing unbounded.
+        功能:
+        - 首先尝试 PASSIVE WAL checkpoint，帮助防止 WAL 文件无限增长
+        - 然后关闭连接
+
+        使用场景: 应用退出时调用，清理资源
         """
         with self._lock:
             if self._conn:
@@ -362,7 +431,22 @@ class SessionDB:
         user_id: str = None,
         parent_session_id: str = None,
     ) -> str:
-        """Create a new session record. Returns the session_id."""
+        """创建新会话记录。
+
+        参数:
+            session_id (str): 会话唯一标识符
+            source (str): 会话来源（'cli', 'telegram', 'discord' 等）
+            model (str): 使用的模型名称
+            model_config (Dict): 模型配置（温度、max_tokens 等）
+            system_prompt (str): 完整的系统提示快照
+            user_id (str): 平台用户 ID（网关门面）
+            parent_session_id (str): 父会话 ID（用于压缩分割或子智能体）
+
+        返回值:
+            str: 会话 ID
+
+        使用场景: 新对话开始时调用，初始化会话元数据
+        """
         def _do(conn):
             conn.execute(
                 """INSERT OR IGNORE INTO sessions (id, source, user_id, model, model_config,
@@ -383,7 +467,14 @@ class SessionDB:
         return session_id
 
     def end_session(self, session_id: str, end_reason: str) -> None:
-        """Mark a session as ended."""
+        """标记会话为已结束。
+
+        参数:
+            session_id (str): 会话 ID
+            end_reason (str): 结束原因（'max_iterations', 'user_exit', 'error' 等）
+
+        使用场景: 对话结束时调用，记录结束时间和原因
+        """
         def _do(conn):
             conn.execute(
                 "UPDATE sessions SET ended_at = ?, end_reason = ? WHERE id = ?",
@@ -392,7 +483,13 @@ class SessionDB:
         self._execute_write(_do)
 
     def reopen_session(self, session_id: str) -> None:
-        """Clear ended_at/end_reason so a session can be resumed."""
+        """清除 ended_at/end_reason，使会话可以恢复。
+
+        参数:
+            session_id (str): 要恢复的会话 ID
+
+        使用场景: 用户通过 --resume 参数恢复之前的会话时调用
+        """
         def _do(conn):
             conn.execute(
                 "UPDATE sessions SET ended_at = NULL, end_reason = NULL WHERE id = ?",
@@ -802,11 +899,30 @@ class SessionDB:
         reasoning_details: Any = None,
         codex_reasoning_items: Any = None,
     ) -> int:
-        """
-        Append a message to a session. Returns the message row ID.
+        """追加消息到会话。返回消息行 ID。
 
-        Also increments the session's message_count (and tool_call_count
-        if role is 'tool' or tool_calls is present).
+        功能:
+        - 将消息插入到 messages 表
+        - 自动更新 FTS5 索引（通过触发器）
+        - 增加会话的 message_count（如果有工具调用，也增加 tool_call_count）
+
+        参数:
+            session_id (str): 会话 ID
+            role (str): 消息角色（'user', 'assistant', 'tool', 'system'）
+            content (str): 消息内容
+            tool_name (str): 工具名称（tool 角色时）
+            tool_calls (Any): 工具调用列表（assistant 角色时）
+            tool_call_id (str): 工具调用 ID（tool 角色时）
+            token_count (int): token 数量
+            finish_reason (str): 完成原因（'stop', 'tool_calls', 'length' 等）
+            reasoning (str): 推理文本（assistant 角色时）
+            reasoning_details (Any): 结构化推理详情（assistant 角色时）
+            codex_reasoning_items (Any): Codex 推理项（assistant 角色时）
+
+        返回值:
+            int: 消息行 ID
+
+        使用场景: 每次 LLM API 调用后，保存用户消息、助手响应和工具结果
         """
         # Serialize structured fields to JSON before entering the write txn
         reasoning_details_json = (
@@ -864,7 +980,16 @@ class SessionDB:
         return self._execute_write(_do)
 
     def get_messages(self, session_id: str) -> List[Dict[str, Any]]:
-        """Load all messages for a session, ordered by timestamp."""
+        """加载会话的所有消息，按时间戳排序。
+
+        参数:
+            session_id (str): 会话 ID
+
+        返回值:
+            List[Dict]: 消息列表，每个消息是一个字典
+
+        使用场景: 恢复会话历史、导出会话、调试
+        """
         with self._lock:
             cursor = self._conn.execute(
                 "SELECT * FROM messages WHERE session_id = ? ORDER BY timestamp, id",
@@ -884,9 +1009,20 @@ class SessionDB:
         return result
 
     def get_messages_as_conversation(self, session_id: str) -> List[Dict[str, Any]]:
-        """
-        Load messages in the OpenAI conversation format (role + content dicts).
-        Used by the gateway to restore conversation history.
+        """以 OpenAI 对话格式加载消息（role + content 字典）。
+
+        功能:
+        - 将数据库格式转换为 OpenAI API 格式
+        - 反序列化工具调用和推理字段
+        - 恢复 assistant 消息的推理字段，用于多轮推理连续性
+
+        参数:
+            session_id (str): 会话 ID
+
+        返回值:
+            List[Dict]: OpenAI 格式的消息列表
+
+        使用场景: 网关门面恢复对话历史，用于继续会话
         """
         with self._lock:
             cursor = self._conn.execute(
@@ -996,17 +1132,58 @@ class SessionDB:
         limit: int = 20,
         offset: int = 0,
     ) -> List[Dict[str, Any]]:
-        """
-        Full-text search across session messages using FTS5.
+        """使用 FTS5 跨会话消息进行全文搜索。
 
-        Supports FTS5 query syntax:
-          - Simple keywords: "docker deployment"
-          - Phrases: '"exact phrase"'
-          - Boolean: "docker OR kubernetes", "python NOT java"
-          - Prefix: "deploy*"
+        功能概括:
+        - 基于 FTS5 虚拟表的全文搜索
+        - 支持复杂的查询语法（关键词、短语、布尔、前缀）
+        - 返回匹配消息和上下文（前后各 1 条消息）
+        - 自动消毒用户输入，防止 FTS5 语法错误
 
-        Returns matching messages with session metadata, content snippet,
-        and surrounding context (1 message before and after the match).
+        参数:
+            query (str): 搜索查询
+            source_filter (List[str]): 来源过滤（例如 ['cli', 'telegram']）
+            exclude_sources (List[str]): 排除的来源
+            role_filter (List[str]): 角色过滤（例如 ['user', 'assistant']）
+            limit (int): 返回结果数量限制（默认：20）
+            offset (int): 偏移量（默认：0）
+
+        返回值:
+            List[Dict]: 匹配消息列表，包含：
+                - id: 消息 ID
+                - session_id: 会话 ID
+                - role: 消息角色
+                - snippet: 带高亮的摘要（>>> 和 <<< 标记匹配）
+                - timestamp: 时间戳
+                - tool_name: 工具名称
+                - source: 来源
+                - model: 模型
+                - context: 上下文消息（前后各 1 条）
+
+        支持的查询语法:
+            - 简单关键词: "docker deployment"
+            - 短语: '"exact phrase"'（精确匹配）
+            - 布尔: "docker OR kubernetes", "python NOT java"
+            - 前缀: "deploy*"（通配符）
+
+        使用场景:
+            1. 查找历史对话中的特定内容
+            2. 搜索工具调用记录
+            3. 跨会话知识检索
+            4. CLI /search 命令实现
+
+        示例:
+            # 简单搜索
+            results = db.search_messages("docker deployment")
+            
+            # 短语搜索
+            results = db.search_messages('"exact phrase"')
+            
+            # 布尔搜索
+            results = db.search_messages("docker OR kubernetes")
+            
+            # 前缀搜索
+            results = db.search_messages("deploy*")
         """
         if not query or not query.strip():
             return []

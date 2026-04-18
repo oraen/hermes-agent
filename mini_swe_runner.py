@@ -1,29 +1,32 @@
 #!/usr/bin/env python3
-"""
-SWE Runner with Hermes Trajectory Format
+"""SWE（软件工程）任务运行器，使用 Hermes 轨迹格式。
 
-A runner that uses Hermes-Agent's built-in execution environments
-(local, docker, modal) and outputs trajectories in the Hermes-Agent format
-compatible with batch_runner.py and trajectory_compressor.py.
+使用 Hermes-Agent 内置的执行环境（local、docker、modal）运行任务，
+并输出与 batch_runner.py 和 trajectory_compressor.py 兼容的 Hermes 格式轨迹。
 
-Features:
-- Uses Hermes-Agent's Docker, Modal, or Local environments for command execution
-- Outputs trajectories in Hermes format (from/value pairs with <tool_call>/<tool_response> XML)
-- Compatible with the trajectory compression pipeline
-- Supports batch processing from JSONL prompt files
+特性：
+- 使用 Hermes-Agent 的 Docker、Modal 或 Local 环境执行命令
+- 输出 Hermes 格式的轨迹（from/value 对，包含 <tool_call>/<tool_response> XML）
+- 与轨迹压缩管道兼容
+- 支持从 JSONL 提示文件批量处理
 
-Usage:
-    # Run a single task with local environment
+使用示例：
+    # 使用本地环境运行单个任务
     python mini_swe_runner.py --task "Create a hello world Python script" --env local
     
-    # Run with Docker
+    # 使用 Docker 运行
     python mini_swe_runner.py --task "List files in /tmp" --env docker --image python:3.11-slim
     
-    # Run with Modal (cloud)
+    # 使用 Modal（云端）运行
     python mini_swe_runner.py --task "Install numpy and test it" --env modal --image python:3.11-slim
     
-    # Batch mode from JSONL file
+    # 从 JSONL 文件批量运行
     python mini_swe_runner.py --prompts_file prompts.jsonl --output_file trajectories.jsonl --env docker
+
+主要用途：
+    - 运行 SWE-bench 软件工程评估任务
+    - 生成训练数据轨迹（用于模型微调）
+    - 测试 agent 在不同执行环境中的表现
 """
 
 import json
@@ -105,18 +108,30 @@ def create_environment(
     timeout: int = 60,
     **kwargs
 ):
-    """
-    Create an execution environment using Hermes-Agent's built-in backends.
+    """使用 Hermes-Agent 的内置后端创建执行环境。
     
-    Args:
-        env_type: One of "local", "docker", "modal"
-        image: Docker/Modal image name (ignored for local)
-        cwd: Working directory
-        timeout: Default command timeout
-        **kwargs: Additional environment-specific options
-        
-    Returns:
-        Environment instance with execute() and cleanup() methods
+    功能概括：
+        工厂函数，根据环境类型创建相应的执行环境实例。
+        支持本地、Docker 容器和 Modal 云端三种环境。
+    
+    参数：
+        env_type: 环境类型，"local"（本地）、"docker"（容器）、"modal"（云端）
+        image: Docker/Modal 镜像名称（本地环境忽略此参数）
+        cwd: 工作目录
+        timeout: 默认命令超时时间（秒）
+        **kwargs: 其他环境特定选项
+    
+    返回值：
+        Environment: 环境实例，具有 execute() 和 cleanup() 方法
+    
+    主要用于：
+        - MiniSWERunner._create_env() 中创建任务执行环境
+        - 为每个任务提供隔离的执行沙箱
+    
+    环境选择：
+        - local: 直接在主机上执行，无隔离
+        - docker: 在 Docker 容器中执行，文件系统隔离
+        - modal: 在 Modal 云端执行，适合需要大量资源的任务
     """
     if env_type == "local":
         from tools.environments.local import LocalEnvironment
@@ -139,9 +154,23 @@ def create_environment(
 # ============================================================================
 
 class MiniSWERunner:
-    """
-    Agent runner that uses Hermes-Agent's built-in execution environments
-    and outputs trajectories in Hermes-Agent format.
+    """使用 Hermes-Agent 内置执行环境并输出 Hermes 格式轨迹的 Agent 运行器。
+    
+    功能概括：
+        管理完整的 agent 任务执行生命周期：
+        1. 初始化 LLM 客户端和执行环境
+        2. 执行 agent 对话循环（调用工具、获取结果）
+        3. 将内部消息格式转换为 Hermes 轨迹格式
+        4. 支持单任务和批量任务模式
+    
+    主要用途：
+        - 运行 SWE-bench 软件工程任务
+        - 生成用于模型微调的训练数据
+        - 测试不同模型和环境组合的表现
+    
+    轨迹格式：
+        输出标准的 Hermes 对话格式，包含 system/human/gpt/tool 角色，
+        使用 <tool_call> 和 <tool_response> XML 标签标记工具调用和结果。
     """
     
     def __init__(
@@ -156,19 +185,35 @@ class MiniSWERunner:
         command_timeout: int = 60,
         verbose: bool = False,
     ):
-        """
-        Initialize the Mini-SWE Runner.
+        """初始化 Mini-SWE 运行器。
         
-        Args:
-            model: Model name for OpenAI-compatible API
-            base_url: API base URL (optional, uses env vars if not provided)
-            api_key: API key (optional, uses env vars if not provided)
-            env_type: Environment type - "local", "docker", or "modal"
-            image: Docker/Modal image (ignored for local)
-            cwd: Working directory for commands
-            max_iterations: Maximum tool-calling iterations
-            command_timeout: Default timeout for commands
-            verbose: Enable verbose logging
+        功能概括：
+            配置 LLM 客户端、执行环境参数和工具定义。
+            自动从环境变量或显式参数解析 API 凭据。
+        
+        参数：
+            model: OpenAI 兼容 API 的模型名称
+            base_url: API 基础 URL（可选，未提供时使用环境变量）
+            api_key: API 密钥（可选，未提供时使用环境变量）
+            env_type: 环境类型 - "local"、"docker" 或 "modal"
+            image: Docker/Modal 镜像（本地环境忽略）
+            cwd: 命令的工作目录
+            max_iterations: 最大工具调用迭代次数
+            command_timeout: 命令默认超时时间（秒）
+            verbose: 是否启用详细日志
+        
+        返回值：
+            无
+        
+        主要用于：
+            - main() 函数中初始化运行器
+            - 为后续任务执行准备环境
+        
+        LLM 客户端解析顺序：
+            1. 显式提供的 api_key/base_url
+            2. 通过 resolve_provider_client() 使用 OpenRouter
+            3. 自动检测可用提供商
+            4. 回退到 OpenRouter 默认配置
         """
         self.model = model
         self.max_iterations = max_iterations
@@ -225,7 +270,21 @@ class MiniSWERunner:
         print(f"   Max iterations: {self.max_iterations}")
     
     def _create_env(self):
-        """Create the execution environment."""
+        """创建执行环境。
+        
+        功能概括：
+            调用 create_environment() 工厂函数创建隔离的执行环境。
+            每个任务开始时调用，确保环境干净。
+        
+        参数：
+            无
+        
+        返回值：
+            无（设置 self.env 属性）
+        
+        主要用于：
+            - run_task() 开始时初始化环境
+        """
         print(f"🔧 Creating {self.env_type} environment...")
         self.env = create_environment(
             env_type=self.env_type,
@@ -236,7 +295,22 @@ class MiniSWERunner:
         print("✅ Environment ready")
     
     def _cleanup_env(self):
-        """Cleanup the execution environment."""
+        """清理执行环境。
+        
+        功能概括：
+            释放执行环境资源（停止容器、清理临时文件等）。
+            每个任务结束时调用，确保资源不泄漏。
+        
+        参数：
+            无
+        
+        返回值：
+            无
+        
+        主要用于：
+            - run_task() 结束时清理环境
+            - finally 块中确保即使异常也清理
+        """
         if self.env is not None:
             if hasattr(self.env, 'cleanup'):
                 self.env.cleanup()
@@ -245,15 +319,25 @@ class MiniSWERunner:
             self.env = None
     
     def _execute_command(self, command: str, timeout: int = None) -> Dict[str, Any]:
-        """
-        Execute a command in the environment.
+        """在环境中执行命令。
         
-        Args:
-            command: Bash command to execute
-            timeout: Optional timeout override
-            
-        Returns:
-            Dict with 'output' and 'returncode'
+        功能概括：
+            封装环境 execute() 调用，提供统一的错误处理和返回格式。
+            如果环境未创建则自动创建。
+        
+        参数：
+            command: 要执行的 bash 命令
+            timeout: 可选的超时覆盖（秒），未提供时使用默认值
+        
+        返回值：
+            Dict: 包含以下键：
+                - output: 命令输出（stdout + stderr）
+                - exit_code: 退出码（0 表示成功）
+                - error: 错误信息（None 表示无错误）
+        
+        主要用于：
+            - run_task() 中执行 agent 的工具调用
+            - 为 agent 提供命令执行结果
         """
         if self.env is None:
             self._create_env()
@@ -273,7 +357,22 @@ class MiniSWERunner:
             }
     
     def _format_tools_for_system_message(self) -> str:
-        """Format tool definitions for the system message."""
+        """将工具定义格式化为系统消息字符串。
+        
+        功能概括：
+            将工具 schema 转换为 JSON 字符串，嵌入系统提示中。
+            移除 'required' 字段以简化格式。
+        
+        参数：
+            无
+        
+        返回值：
+            str: JSON 格式的工具定义列表
+        
+        主要用于：
+            - _convert_to_hermes_format() 中构建系统消息
+            - 告知 LLM 可用的工具及其参数
+        """
         formatted_tools = []
         for tool in self.tools:
             func = tool["function"]
@@ -291,10 +390,32 @@ class MiniSWERunner:
         user_query: str,
         completed: bool
     ) -> List[Dict[str, Any]]:
-        """
-        Convert internal message format to Hermes trajectory format.
+        """将内部消息格式转换为 Hermes 轨迹格式。
         
-        This produces the exact format used by batch_runner.py.
+        功能概括：
+            将 OpenAI 风格的消息列表转换为 Hermes 标准的 from/value 对格式。
+            生成与 batch_runner.py 完全相同的格式，包含 XML 标签标记工具调用。
+        
+        参数：
+            messages: 内部消息列表，包含 role、content、tool_calls 等字段
+            user_query: 用户原始查询
+            completed: 任务是否完成
+        
+        返回值：
+            List[Dict[str, Any]]: Hermes 轨迹消息列表
+                每条消息包含 "from" 和 "value" 键
+                - from: "system"/"human"/"gpt"/"tool"
+                - value: 消息内容（可能包含 XML 标签）
+        
+        主要用于：
+            - run_task() 结束时转换轨迹格式
+            - 输出到 JSONL 文件供后续训练使用
+        
+        格式特点：
+            - 系统消息包含 <tools> 标签和工具定义
+            - 工具调用使用 <tool_call> 标签包裹
+            - 工具结果使用 <tool_response> 标签包裹
+            - 推理内容使用 <think> 标签（如果有）
         """
         trajectory = []
         
@@ -396,14 +517,33 @@ class MiniSWERunner:
         return trajectory
     
     def run_task(self, task: str) -> Dict[str, Any]:
-        """
-        Run a single task and return the result with trajectory.
+        """运行单个任务并返回包含轨迹的结果。
         
-        Args:
-            task: The task/prompt to execute
-            
-        Returns:
-            Dict with trajectory, completion status, and metadata
+        功能概括：
+            执行完整的 agent 对话循环：
+            1. 创建执行环境
+            2. 初始化消息历史
+            3. 循环调用 LLM API 和执行工具
+            4. 检测任务完成信号
+            5. 清理环境
+            6. 转换为 Hermes 轨迹格式
+        
+        参数：
+            task: 要执行的任务/提示词
+        
+        返回值：
+            Dict: 包含以下键：
+                - conversations: Hermes 格式的轨迹消息列表
+                - completed: 任务是否成功完成（bool）
+                - api_calls: API 调用次数
+                - metadata: 元数据（模型、环境类型、时间戳）
+        
+        主要用于：
+            - main() 单任务模式
+            - run_batch() 批量模式中的每个任务
+        
+        完成信号：
+            当命令输出包含 "MINI_SWE_AGENT_FINAL_OUTPUT" 时认为任务完成。
         """
         print(f"\n{'='*60}")
         print(f"📝 Task: {task[:80]}{'...' if len(task) > 80 else ''}")
@@ -559,15 +699,27 @@ Complete the user's task step by step."""
         prompts: List[str],
         output_file: str
     ) -> List[Dict[str, Any]]:
-        """
-        Run multiple tasks and save trajectories to a JSONL file.
+        """运行多个任务并将轨迹保存到 JSONL 文件。
         
-        Args:
-            prompts: List of task prompts
-            output_file: Output JSONL file path
-            
-        Returns:
-            List of results
+        功能概括：
+            批量执行任务列表，每个任务完成后立即写入文件，
+            确保即使中断也不会丢失已完成的结果。
+        
+        参数：
+            prompts: 任务提示词列表
+            output_file: 输出 JSONL 文件路径
+        
+        返回值：
+            List[Dict[str, Any]]: 所有任务的结果列表
+        
+        主要用于：
+            - main() 批量模式（使用 --prompts_file）
+            - 生成大规模训练数据集
+        
+        容错机制：
+            - 每个任务独立 try-except，一个失败不影响其他
+            - 每个任务完成后立即 flush 到文件
+            - 失败任务记录错误信息到结果中
         """
         results = []
         
@@ -625,31 +777,42 @@ def main(
     timeout: int = 60,
     verbose: bool = False,
 ):
-    """
-    Run SWE tasks with Hermes trajectory format output.
+    """运行 SWE 任务并输出 Hermes 格式轨迹的 CLI 主入口。
     
-    Args:
-        task: Single task to run (use this OR prompts_file)
-        prompts_file: JSONL file with prompts (each line: {"prompt": "..."})
-        output_file: Output JSONL file for trajectories
-        model: Model name (default: claude-sonnet-4-20250514)
-        base_url: API base URL (optional)
-        api_key: API key (optional, uses env vars)
-        env: Environment type - "local", "docker", or "modal"
-        image: Docker/Modal image (default: python:3.11-slim)
-        cwd: Working directory (default: /tmp)
-        max_iterations: Maximum tool-calling iterations (default: 15)
-        timeout: Command timeout in seconds (default: 60)
-        verbose: Enable verbose logging
-        
-    Examples:
-        # Single task with local environment
+    功能概括：
+        解析命令行参数，初始化 MiniSWERunner，执行单任务或批量任务，
+        并将轨迹结果保存到 JSONL 文件。
+    
+    参数：
+        task: 要运行的单个任务（使用此参数或 prompts_file）
+        prompts_file: JSONL 提示文件路径（每行：{"prompt": "..."}）
+        output_file: 轨迹输出 JSONL 文件路径
+        model: 模型名称（默认：claude-sonnet-4-20250514）
+        base_url: API 基础 URL（可选）
+        api_key: API 密钥（可选，使用环境变量）
+        env: 环境类型 - "local"、"docker" 或 "modal"
+        image: Docker/Modal 镜像（默认：python:3.11-slim）
+        cwd: 工作目录（默认：/tmp）
+        max_iterations: 最大工具调用迭代次数（默认：15）
+        timeout: 命令超时时间（秒，默认：60）
+        verbose: 是否启用详细日志
+    
+    返回值：
+        无（直接运行并输出结果）
+    
+    主要用于：
+        - 命令行入口点
+        - 运行 SWE-bench 评估任务
+        - 生成训练数据
+    
+    使用示例：
+        # 使用本地环境运行单个任务
         python mini_swe_runner.py --task "Create hello.py that prints Hello World"
         
-        # Single task with Docker
+        # 使用 Docker 运行单个任务
         python mini_swe_runner.py --task "List files" --env docker
         
-        # Batch from file
+        # 从文件批量运行
         python mini_swe_runner.py --prompts_file tasks.jsonl --output_file results.jsonl
     """
     print("🚀 Mini-SWE Runner with Hermes Trajectory Format")

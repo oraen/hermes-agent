@@ -1,33 +1,37 @@
 #!/usr/bin/env python3
-"""
-Toolsets Module
+"""Hermes Agent 工具集（Toolsets）管理模块。
 
-This module provides a flexible system for defining and managing tool aliases/toolsets.
-Toolsets allow you to group tools together for specific scenarios and can be composed
-from individual tools or other toolsets.
+本模块提供灵活的工具集定义和管理系统，允许将工具分组以适配不同场景。
+工具集可以包含独立工具，也可以组合其他工具集，形成层次化工具管理。
 
-Features:
-- Define custom toolsets with specific tools
-- Compose toolsets from other toolsets
-- Built-in common toolsets for typical use cases
-- Easy extension for new toolsets
-- Support for dynamic toolset resolution
+核心功能：
+- 定义自定义工具集，包含特定工具组合
+- 工具集组合：一个工具集可以包含其他工具集
+- 内置常见场景的工具集（研究、开发、调试等）
+- 支持动态工具集解析和插件扩展
+- 支持所有消息平台的工具集配置
 
-Usage:
+使用示例：
     from toolsets import get_toolset, resolve_toolset, get_all_toolsets
     
-    # Get tools for a specific toolset
+    # 获取特定工具集的定义
     tools = get_toolset("research")
     
-    # Resolve a toolset to get all tool names (including from composed toolsets)
+    # 解析工具集，获取所有工具名称（包括组合的工具集）
     all_tools = resolve_toolset("full_stack")
+
+主要用途：
+    - 为不同平台（CLI、Telegram、Discord 等）定义不同的工具访问权限
+    - 为不同场景（研究、开发、调试）提供预设工具组合
+    - 支持用户自定义工具集
+    - 被 model_tools.py、batch_runner.py 等模块广泛引用
 """
 
 from typing import List, Dict, Any, Set, Optional
 
 
-# Shared tool list for CLI and all messaging platform toolsets.
-# Edit this once to update all platforms simultaneously.
+# CLI 和所有消息平台共享的核心工具列表。
+# 修改此处可同时更新所有平台的工具配置。
 _HERMES_CORE_TOOLS = [
     # Web
     "web_search", "web_extract",
@@ -63,8 +67,8 @@ _HERMES_CORE_TOOLS = [
 ]
 
 
-# Core toolset definitions
-# These can include individual tools or reference other toolsets
+# 核心工具集定义
+# 每个工具集可以包含独立工具或引用其他工具集
 TOOLSETS = {
     # Basic toolsets - individual tool categories
     "web": {
@@ -399,15 +403,31 @@ TOOLSETS = {
 
 
 def get_toolset(name: str) -> Optional[Dict[str, Any]]:
-    """
-    Get a toolset definition by name.
+    """按名称获取工具集定义。
     
-    Args:
-        name (str): Name of the toolset
-        
-    Returns:
-        Dict: Toolset definition with description, tools, and includes
-        None: If toolset not found
+    功能概括：
+        获取指定工具集的完整定义，包括描述、工具列表和包含的其他工具集。
+        支持静态定义的工具集和插件注册的工具集。
+    
+    参数：
+        name: 工具集名称（如 "web"、"terminal"、"hermes-cli"）
+    
+    返回值：
+        dict | None: 工具集定义字典，包含以下键：
+            - description: 工具集描述
+            - tools: 直接包含的工具列表
+            - includes: 包含的其他工具集列表
+            如果工具集不存在则返回 None
+    
+    主要用于：
+        - resolve_toolset() 的前置步骤
+        - 查询工具集元数据
+        - 插件工具集的动态解析
+    
+    解析顺序：
+        1. 查找静态 TOOLSETS 字典
+        2. 查找插件注册的工具集
+        3. 查找 MCP 服务器工具集别名
     """
     toolset = TOOLSETS.get(name)
     if toolset:
@@ -445,18 +465,31 @@ def get_toolset(name: str) -> Optional[Dict[str, Any]]:
 
 
 def resolve_toolset(name: str, visited: Set[str] = None) -> List[str]:
-    """
-    Recursively resolve a toolset to get all tool names.
+    """递归解析工具集，获取所有工具名称。
     
-    This function handles toolset composition by recursively resolving
-    included toolsets and combining all tools.
+    功能概括：
+        递归解析工具集及其包含的所有子工具集，返回完整的工具名称列表。
+        处理工具集组合、循环检测和菱形依赖（diamond dependencies）。
     
-    Args:
-        name (str): Name of the toolset to resolve
-        visited (Set[str]): Set of already visited toolsets (for cycle detection)
-        
-    Returns:
-        List[str]: List of all tool names in the toolset
+    参数：
+        name: 要解析的工具集名称
+              特殊值 "all" 或 "*" 表示解析所有工具集中的所有工具
+        visited: 已访问的工具集集合，用于循环检测
+                调用方通常不需要传入此参数
+    
+    返回值：
+        List[str]: 排序后的工具名称列表
+                  如果工具集不存在或检测到循环则返回空列表
+    
+    主要用于：
+        - get_tool_definitions() 中解析启用的工具集
+        - 获取某个场景下所有可用工具
+        - 工具集依赖关系的完全展开
+    
+    特性：
+        - 自动处理循环依赖（安全返回空列表）
+        - 支持菱形依赖（多个路径引用同一工具集，只解析一次）
+        - 特殊别名 "all" 和 "*" 自动包含未来新增的工具集
     """
     if visited is None:
         visited = set()
@@ -498,14 +531,21 @@ def resolve_toolset(name: str, visited: Set[str] = None) -> List[str]:
 
 
 def resolve_multiple_toolsets(toolset_names: List[str]) -> List[str]:
-    """
-    Resolve multiple toolsets and combine their tools.
+    """解析多个工具集并合并它们的工具。
     
-    Args:
-        toolset_names (List[str]): List of toolset names to resolve
-        
-    Returns:
-        List[str]: Combined list of all tool names (deduplicated)
+    功能概括：
+        批量解析多个工具集，将所有工具合并并去重，返回排序后的工具列表。
+    
+    参数：
+        toolset_names: 要解析的工具集名称列表
+                      （如 ["web", "terminal", "file"]）
+    
+    返回值：
+        List[str]: 合并去重并排序后的所有工具名称列表
+    
+    主要用于：
+        - 批量处理时组合多个工具集
+        - 用户同时启用多个工具集时获取完整工具列表
     """
     all_tools = set()
     
@@ -517,10 +557,21 @@ def resolve_multiple_toolsets(toolset_names: List[str]) -> List[str]:
 
 
 def _get_plugin_toolset_names() -> Set[str]:
-    """Return toolset names registered by plugins (from the tool registry).
-
-    These are toolsets that exist in the registry but not in the static
-    ``TOOLSETS`` dict — i.e. they were added by plugins at load time.
+    """返回插件注册的工具集名称。
+    
+    功能概括：
+        从工具注册中心获取由插件动态注册的工具集名称，
+        这些工具集不存在于静态 TOOLSETS 字典中。
+    
+    参数：
+        无
+    
+    返回值：
+        Set[str]: 插件注册的工具集名称集合
+    
+    主要用于：
+        - get_all_toolsets() 中合并静态和动态工具集
+        - validate_toolset() 中验证插件工具集
     """
     try:
         from tools.registry import registry
@@ -534,7 +585,23 @@ def _get_plugin_toolset_names() -> Set[str]:
 
 
 def _get_registry_toolset_aliases() -> Dict[str, str]:
-    """Return explicit toolset aliases registered in the live registry."""
+    """返回工具注册中心中注册的显式工具集别名。
+    
+    功能概括：
+        获取 MCP 服务器或其他组件注册的工具集别名映射。
+        例如：MCP 服务器 "weather" 可能别名指向 "weather-api" 工具集。
+    
+    参数：
+        无
+    
+    返回值：
+        Dict[str, str]: 别名到规范名称的映射字典
+                       {"别名": "规范工具集名称"}
+    
+    主要用于：
+        - get_toolset() 中解析 MCP 服务器别名
+        - validate_toolset() 中验证别名
+    """
     try:
         from tools.registry import registry
         return registry.get_registered_toolset_aliases()
@@ -543,13 +610,23 @@ def _get_registry_toolset_aliases() -> Dict[str, str]:
 
 
 def get_all_toolsets() -> Dict[str, Dict[str, Any]]:
-    """
-    Get all available toolsets with their definitions.
-
-    Includes both statically-defined toolsets and plugin-registered ones.
+    """获取所有可用工具集及其定义。
     
-    Returns:
-        Dict: All toolset definitions
+    功能概括：
+        返回包含静态定义工具和插件注册工具的完整工具集字典。
+        优先使用别名作为显示名称。
+    
+    参数：
+        无
+    
+    返回值：
+        Dict[str, Dict]: 所有工具集定义
+                        {工具集名称: 工具集定义字典}
+    
+    主要用于：
+        - 显示可用工具集列表（如 hermes tools 命令）
+        - 工具集配置 UI 的数据源
+        - 遍历所有工具集进行操作
     """
     result = dict(TOOLSETS)
     aliases = _get_registry_toolset_aliases()
@@ -568,13 +645,21 @@ def get_all_toolsets() -> Dict[str, Dict[str, Any]]:
 
 
 def get_toolset_names() -> List[str]:
-    """
-    Get names of all available toolsets (excluding aliases).
-
-    Includes plugin-registered toolset names.
+    """获取所有可用工具集的名称列表（不包括别名）。
     
-    Returns:
-        List[str]: List of toolset names
+    功能概括：
+        返回所有工具集的名称，包括静态定义和插件注册的。
+        对于有别名的插件工具集，使用别名而非规范名称。
+    
+    参数：
+        无
+    
+    返回值：
+        List[str]: 排序后的工具集名称列表
+    
+    主要用于：
+        - resolve_toolset("all") 中遍历所有工具集
+        - 生成工具集选择列表
     """
     names = set(TOOLSETS.keys())
     aliases = _get_registry_toolset_aliases()
@@ -591,14 +676,25 @@ def get_toolset_names() -> List[str]:
 
 
 def validate_toolset(name: str) -> bool:
-    """
-    Check if a toolset name is valid.
+    """检查工具集名称是否有效。
     
-    Args:
-        name (str): Toolset name to validate
-        
-    Returns:
-        bool: True if valid, False otherwise
+    功能概括：
+        验证给定的工具集名称是否存在于系统中，包括静态定义、
+        插件注册和别名。
+    
+    参数：
+        name: 要验证的工具集名称
+    
+    返回值：
+        bool: 如果工具集有效返回 True，否则返回 False
+    
+    主要用于：
+        - get_tool_definitions() 中验证启用的工具集
+        - 用户输入的工具集名称验证
+        - 配置文件中的工具集名称校验
+    
+    特殊支持：
+        - "all" 和 "*" 始终返回 True（表示所有工具）
     """
     # Accept special alias names for convenience
     if name in {"all", "*"}:
@@ -616,14 +712,29 @@ def create_custom_toolset(
     tools: List[str] = None,
     includes: List[str] = None
 ) -> None:
-    """
-    Create a custom toolset at runtime.
+    """在运行时创建自定义工具集。
     
-    Args:
-        name (str): Name for the new toolset
-        description (str): Description of the toolset
-        tools (List[str]): Direct tools to include
-        includes (List[str]): Other toolsets to include
+    功能概括：
+        动态创建新的工具集并添加到 TOOLSETS 字典中。
+        允许用户或插件在运行时定义新的工具组合。
+    
+    参数：
+        name: 新工具集的名称（如 "my_custom_tools"）
+        description: 工具集的描述信息
+        tools: 直接包含的工具名称列表，默认空列表
+        includes: 要包含的其他工具集名称列表，默认空列表
+    
+    返回值：
+        无（直接修改全局 TOOLSETS 字典）
+    
+    主要用于：
+        - 用户通过配置文件自定义工具集
+        - 插件动态注册工具集
+        - 临时工具组合的创建
+    
+    注意：
+        - 创建的工具集在整个进程生命周期内有效
+        - 名称冲突会覆盖现有工具集
     """
     TOOLSETS[name] = {
         "description": description,
@@ -635,14 +746,30 @@ def create_custom_toolset(
 
 
 def get_toolset_info(name: str) -> Dict[str, Any]:
-    """
-    Get detailed information about a toolset including resolved tools.
+    """获取工具集的详细信息，包括解析后的完整工具列表。
     
-    Args:
-        name (str): Toolset name
-        
-    Returns:
-        Dict: Detailed toolset information
+    功能概括：
+        返回工具集的完整信息，包括直接工具、包含的工具集、
+        解析后的所有工具以及统计信息。
+    
+    参数：
+        name: 工具集名称
+    
+    返回值：
+        Dict: 包含以下键的详细工具集信息：
+            - name: 工具集名称
+            - description: 工具集描述
+            - direct_tools: 直接包含的工具列表
+            - includes: 包含的其他工具集列表
+            - resolved_tools: 解析后的所有工具名称（排序）
+            - tool_count: 工具总数
+            - is_composite: 是否为复合工具集（包含其他工具集）
+            如果工具集不存在则返回 None
+    
+    主要用于：
+        - 显示工具集详细信息（如 hermes tools --info）
+        - 调试工具集配置
+        - 工具集文档生成
     """
     toolset = get_toolset(name)
     if not toolset:

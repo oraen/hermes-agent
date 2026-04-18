@@ -1,22 +1,27 @@
 #!/usr/bin/env python3
-"""
-RL Training CLI Runner
+"""Hermes Agent 强化学习（RL）训练 CLI 运行器。
 
-Dedicated CLI runner for RL training workflows with:
-- Extended timeouts for long-running training
-- RL-focused system prompts
-- Full toolset including RL training tools
-- Special handling for 30-minute check intervals
+专为 RL 训练工作流设计的独立 CLI 运行器，提供：
+- 针对长时间运行训练的扩展超时
+- RL 专注的系统提示
+- 包含 RL 训练工具的完整工具集
+- 30 分钟检查间隔的特殊处理
 
-Usage:
+使用示例：
     python rl_cli.py "Train a model on GSM8k for math reasoning"
     python rl_cli.py --interactive
     python rl_cli.py --list-environments
 
-Environment Variables:
-    TINKER_API_KEY: API key for Tinker service (required)
-    WANDB_API_KEY: API key for WandB metrics (required)
-    OPENROUTER_API_KEY: API key for OpenRouter (required for agent)
+环境变量：
+    TINKER_API_KEY: Tinker 服务的 API 密钥（必需）
+    WANDB_API_KEY: WandB 指标追踪的 API 密钥（必需）
+    OPENROUTER_API_KEY: OpenRouter 的 API 密钥（agent 必需）
+
+主要用途：
+    - 运行 RL 训练任务（语言模型后训练）
+    - 管理 Tinker-Atropos 训练环境
+    - 监控训练进度和指标
+    - 创建和配置新的 RL 环境
 """
 
 import asyncio
@@ -67,11 +72,28 @@ DEFAULT_BASE_URL = OPENROUTER_BASE_URL
 
 
 def load_hermes_config() -> dict:
-    """
-    Load configuration from ~/.hermes/config.yaml.
+    """从 ~/.hermes/config.yaml 加载配置。
     
-    Returns:
-        dict: Configuration with model, base_url, etc.
+    功能概括：
+        读取 Hermes 主配置文件，提取模型和 API 基础 URL 设置。
+        为 RL CLI 提供默认配置，允许命令行参数覆盖。
+    
+    参数：
+        无
+    
+    返回值：
+        dict: 包含以下键的配置字典：
+            - model: 使用的模型名称（如 "anthropic/claude-opus-4.5"）
+            - base_url: API 基础 URL（默认 OpenRouter）
+    
+    主要用于：
+        - main() 函数初始化时加载默认配置
+        - 避免每次都要指定模型和 API URL
+    
+    配置优先级：
+        1. 命令行参数（最高）
+        2. config.yaml 文件
+        3. 代码默认值
     """
     config_path = _hermes_home / 'config.yaml'
     
@@ -178,7 +200,27 @@ RL_TOOLSETS = ["terminal", "web", "rl"]
 # ============================================================================
 
 def check_requirements():
-    """Check that all required environment variables and services are available."""
+    """检查所有必需的环境变量和服务是否可用。
+    
+    功能概括：
+        验证 RL 训练所需的所有 API 密钥是否已配置，
+        包括 OpenRouter、Tinker、WandB 等服务的密钥。
+    
+    参数：
+        无
+    
+    返回值：
+        bool: 如果所有要求都满足返回 True，否则返回 False
+    
+    主要用于：
+        - main() 函数启动时的预检查
+        - 避免在缺少密钥的情况下开始训练
+    
+    检查项：
+        - OPENROUTER_API_KEY: agent 调用必需
+        - TINKER_API_KEY: RL 训练服务必需
+        - WANDB_API_KEY: 指标追踪必需
+    """
     errors = []
     
     # Check API keys
@@ -200,7 +242,25 @@ def check_requirements():
 
 
 def check_tinker_atropos():
-    """Check if tinker-atropos submodule is properly set up."""
+    """检查 tinker-atropos 子模块是否正确设置。
+    
+    功能概括：
+        验证 tinker-atropos RL 训练框架是否存在且包含环境目录。
+        tinker-atropos 是一个 git 子模块，包含 RL 训练的核心逻辑。
+    
+    参数：
+        无
+    
+    返回值：
+        tuple: (是否成功, 结果信息)
+            - 成功: (True, {"path": 路径, "environments_count": 环境数量})
+            - 失败: (False, 错误信息字符串)
+    
+    主要用于：
+        - --check-server 命令的实现
+        - 启动前的环境验证
+        - 诊断子模块未初始化的问题
+    """
     tinker_path = Path(__file__).parent / "tinker-atropos"
     
     if not tinker_path.exists():
@@ -217,7 +277,24 @@ def check_tinker_atropos():
 
 
 def list_environments_sync():
-    """List available environments (synchronous wrapper)."""
+    """列出可用的 RL 环境（同步包装器）。
+    
+    功能概括：
+        调用 rl_list_environments 工具并返回环境列表。
+        将异步工具调用包装为同步函数，方便 CLI 使用。
+    
+    参数：
+        无
+    
+    返回值：
+        dict: 包含环境列表的字典
+            - {"environments": [环境信息列表]}
+            - 或 {"error": 错误信息}
+    
+    主要用于：
+        - --list-environments 命令的实现
+        - 查询可用的 RL 训练环境
+    """
     from tools.rl_training_tool import rl_list_environments
     import json
     
@@ -244,32 +321,43 @@ def main(
     verbose: bool = False,
     save_trajectories: bool = True,
 ):
-    """
-    RL Training CLI - Dedicated runner for RL training workflows.
+    """RL 训练 CLI 主入口函数 - 专为 RL 训练工作流设计的运行器。
     
-    Args:
-        task: The training task/goal (e.g., "Train a model on GSM8k for math")
-        model: Model to use for the agent (reads from ~/.hermes/config.yaml if not provided)
-        api_key: OpenRouter API key (uses OPENROUTER_API_KEY env var if not provided)
-        base_url: API base URL (reads from config or defaults to OpenRouter)
-        max_iterations: Maximum agent iterations (default: 200 for long workflows)
-        interactive: Run in interactive mode (multiple conversations)
-        list_environments: Just list available RL environments and exit
-        check_server: Check if RL API server is running and exit
-        verbose: Enable verbose logging
-        save_trajectories: Save conversation trajectories (default: True for RL)
+    功能概括：
+        启动 RL 训练 agent，支持单次任务模式和交互模式。
+        自动加载配置、验证环境、初始化 agent 并执行训练任务。
     
-    Examples:
-        # Train on a specific environment
+    参数：
+        task: 训练任务/目标（如 "Train a model on GSM8k for math"）
+        model: agent 使用的模型（未提供时从 ~/.hermes/config.yaml 读取）
+        api_key: OpenRouter API 密钥（未提供时使用 OPENROUTER_API_KEY 环境变量）
+        base_url: API 基础 URL（未提供时从配置读取或默认 OpenRouter）
+        max_iterations: agent 最大迭代次数（默认 200，适合长时间工作流）
+        interactive: 是否运行交互模式（多轮对话）
+        list_environments: 仅列出可用 RL 环境并退出
+        check_server: 仅检查 RL API 服务器状态并退出
+        verbose: 是否启用详细日志
+        save_trajectories: 是否保存对话轨迹（RL 默认 True）
+    
+    返回值：
+        无（直接运行并输出结果）
+    
+    主要用于：
+        - 执行 RL 训练任务
+        - 管理 RL 训练环境
+        - 监控训练进度
+    
+    使用示例：
+        # 在特定环境上训练
         python rl_cli.py "Train a model on GSM8k math problems"
         
-        # Interactive mode
+        # 交互模式
         python rl_cli.py --interactive
         
-        # List available environments
+        # 列出可用环境
         python rl_cli.py --list-environments
         
-        # Check server status
+        # 检查服务器状态
         python rl_cli.py --check-server
     """
     # Load config from ~/.hermes/config.yaml
